@@ -148,9 +148,9 @@ In the first code cell, set `GITHUB_REPO_URL` to `https://github.com/ACCOUNT/REP
 | Secret | When |
 | --- | --- |
 | `GITHUB_TOKEN` | The repository is private. A public repository does not need it. |
-| `KAGGLE_USERNAME` and `KAGGLE_KEY` | `DATA_SOURCE` is `kaggle`. Read the mirror's license before downloading it. |
+| `KAGGLE_USERNAME` and `KAGGLE_KEY` | Required. `DATA_SOURCE` is `kaggle`, which downloads the ISCX captures and the CIC CSV files onto Drive. |
 
-The official CIC and ISCX files are behind a registration form. The notebook does not submit that form. Put the files on Drive, or set a direct URL you have checked yourself. Do not download the CIC PCAP days.
+The official CIC file URLs redirect to an HTML index, so the notebook downloads the public Kaggle copies onto Drive instead of submitting the registration form. The CIC download is the MachineLearningCSV files. The PCAP days are not downloaded.
 
 `configs/colab.yaml` points at `/content` and selects CUDA. The notebook writes `MyDrive/ai-traffic-clf/drive_overlay.yaml` instead, keeps boosting on CPU, and stores outputs under `/content/drive/MyDrive/ai-traffic-clf`. The Linux commands, after that overlay exists, are:
 

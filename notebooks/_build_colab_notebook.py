@@ -42,11 +42,19 @@ add(
 # Set this to your repository before running the notebook.
 GITHUB_REPO_URL = ""
 
-# "drive": files are already under DATA_DIR/raw.
-# "kaggle": download with KAGGLE_USERNAME and KAGGLE_KEY from Colab Secrets.
-# "url": download DIRECT_URLS. Verify the mirror and its license yourself.
-DATA_SOURCE = "drive"
-KAGGLE_DATASET = ""
+# "kaggle": download the two public mirrors below into Google Drive.
+# "drive": use files already under DATA_DIR/raw.
+# "url": download DIRECT_URLS. A CIC PCAP-day URL is refused.
+DATA_SOURCE = "kaggle"
+# Listed sizes are the Kaggle API totalBytes values read on 2026-11-06.
+KAGGLE_DATASETS = {
+    "iscx": "caiyafang/iscx-vpn-nonvpn-2016-complete-pcaps",
+    "cic_csv": "shadman1028/cicids2017-official-flow-feature-csv-files",
+}
+KAGGLE_LISTED_BYTES = {
+    "caiyafang/iscx-vpn-nonvpn-2016-complete-pcaps": 26256519566,
+    "shadman1028/cicids2017-official-flow-feature-csv-files": 240838240,
+}
 DIRECT_URLS = {
     # "cic_csv": "https://example.invalid/MachineLearningCSV.zip",
     # "iscx_zip": "https://example.invalid/ISCX-VPN-NonVPN-2016.zip",
@@ -206,17 +214,12 @@ add(
     """
 ## 3. Get the data
 
-CIC-IDS2017 `MachineLearningCSV` and ISCX VPN-nonVPN are behind a registration form on the Canadian Institute for Cybersecurity site. This notebook cannot submit that form for you.
+The official file URLs on `cicresearch.ca` redirect to the UNB dataset index and return HTML, so this notebook does not download from them. With `DATA_SOURCE = "kaggle"` it downloads two public Kaggle copies straight into Google Drive:
 
-Three options, chosen by `DATA_SOURCE`:
+- ISCX packet captures: `caiyafang/iscx-vpn-nonvpn-2016-complete-pcaps` (Kaggle lists 26,256,519,566 bytes). The page says these are the original PCAP archives and that the license stays with the CIC authors. Cite Gerard Draper-Gil, Arash Habibi Lashkari, Mohammad Mamun, and Ali A. Ghorbani, ICISSP 2016.
+- CIC-IDS2017 flow CSVs only: `shadman1028/cicids2017-official-flow-feature-csv-files` (Kaggle lists 240,838,240 bytes; the eight `WorkingHours` CSV names). The Kaggle page lists CC BY 4.0. Cite Iman Sharafaldin, Arash Habibi Lashkari, and Ali A. Ghorbani, ICISSP 2018. The CIC PCAP days are not in this download.
 
-- `drive`: copy the files into `DATA_DIR/raw` yourself. This is the default.
-- `kaggle`: set `KAGGLE_DATASET` and store `KAGGLE_USERNAME` and `KAGGLE_KEY` in Colab Secrets. Confirm the dataset's source and license before using a mirror.
-- `url`: set `DIRECT_URLS`. A URL that looks like a CIC PCAP day is refused. Only the CSV archive is accepted for CIC.
-
-ISCX captures are about 28 GB on the UNB page. The notebook checks free space, downloads the zip, extracts packet captures, and deletes the zip. Your own captures and `sessions.csv` are only read from Drive. They are not downloaded.
-
-Expect a file list. The cell stops if the expected folders are empty.
+Add `KAGGLE_USERNAME` and `KAGGLE_KEY` in Colab Secrets. The key is created at https://www.kaggle.com/settings/account. Drive needs room for both listings, about 26.5 GB, so a 15 GB Drive account will stop before the download. Files already present are skipped. Your own captures and `sessions.csv` are only read from Drive.
 """,
 )
 
@@ -270,22 +273,120 @@ def verify_checksum(path):
 if DATA_SOURCE == "drive":
     print("Using files already on Drive. Nothing will be downloaded.")
 elif DATA_SOURCE == "kaggle":
-    if not KAGGLE_DATASET:
-        raise RuntimeError("Set KAGGLE_DATASET to a Kaggle slug. Confirm its source and license before downloading a mirror.")
+    import io
     from google.colab import userdata
     username = userdata.get("KAGGLE_USERNAME")
     key = userdata.get("KAGGLE_KEY")
+    if not username or not key:
+        raise RuntimeError("Add KAGGLE_USERNAME and KAGGLE_KEY in Colab Secrets. Create the key at https://www.kaggle.com/settings/account. Nothing was downloaded.")
     kaggle_dir = Path("/root/.kaggle")
     kaggle_dir.mkdir(parents=True, exist_ok=True)
     secret = kaggle_dir / "kaggle.json"
     secret.write_text(json.dumps({"username": username, "key": key}), encoding="utf-8")
     secret.chmod(0o600)
-    require_space(Path("/content"), ISCX_PUBLISHED_BYTES + MARGIN_BYTES, "a Kaggle mirror that may contain the ISCX captures")
+    needed = sum(KAGGLE_LISTED_BYTES[slug] for slug in KAGGLE_DATASETS.values())
+    print("kaggle_listed_bytes", needed)
+    print("Drive must hold the ISCX captures and the CIC CSVs. A 15 GB Drive account is too small. The CIC PCAP days are not downloaded.")
+    require_space(DATA_DIR, needed, "the Kaggle ISCX captures and CIC CSV listing sizes")
+    require_space(Path("/content"), 8 * 1024**3, "one capture at a time before it is moved to Drive")
     subprocess.run([sys.executable, "-m", "pip", "install", "-q", "kaggle"], check=True)
-    download_dir = WORK_DIR / "kaggle"
-    download_dir.mkdir(parents=True, exist_ok=True)
-    subprocess.run(["kaggle", "datasets", "download", "-d", KAGGLE_DATASET, "-p", str(download_dir)], check=True)
-    print("Kaggle zip is in", download_dir, ". Confirm the dataset license, then rerun with DATA_SOURCE = 'url' only if you have a direct file URL. This notebook does not guess which unpacked files are ISCX or CIC.")
+
+    def kaggle_files(slug):
+        completed = subprocess.run(["kaggle", "datasets", "files", "-d", slug, "--csv"], capture_output=True, text=True)
+        if completed.returncode != 0:
+            detail = (completed.stderr or completed.stdout or "").strip()[-400:]
+            raise RuntimeError(f"Could not list {slug}. Open https://www.kaggle.com/datasets/{slug} while logged in, then rerun. {detail}")
+        frame = pd.read_csv(io.StringIO(completed.stdout))
+        if "name" not in frame.columns:
+            raise RuntimeError(f"Kaggle file list for {slug} has no name column: {list(frame.columns)}")
+        return frame
+
+    def destination_for(kind, relative_name):
+        relative = Path(str(relative_name).lstrip("/"))
+        suffix = relative.suffix.lower()
+        if kind == "iscx" and suffix in {".pcap", ".pcapng"}:
+            return RAW_DIR / "iscx" / relative
+        if kind == "iscx" and relative.name == "SHA256SUMS.txt":
+            return DATA_DIR / "inventory" / "iscx-SHA256SUMS.txt"
+        if kind == "cic_csv" and suffix == ".csv":
+            return RAW_DIR / "cic-ids2017" / relative.name
+        if kind == "cic_csv" and suffix in {".pcap", ".pcapng"}:
+            raise RuntimeError(f"Refusing {relative.name}. This notebook downloads CIC CSVs only.")
+        return None
+
+    def sha256_file(path):
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    inventory_dir = DATA_DIR / "inventory"
+    inventory_dir.mkdir(parents=True, exist_ok=True)
+    for kind, slug in KAGGLE_DATASETS.items():
+        listing = kaggle_files(slug)
+        kept = []
+        for row in listing.itertuples(index=False):
+            record = row._asdict()
+            target = destination_for(kind, record["name"])
+            listed_size = record.get("size")
+            if target is not None:
+                kept.append((str(record["name"]), None if pd.isna(listed_size) else int(listed_size), target))
+        if not kept:
+            raise RuntimeError(f"{slug} listed no files this notebook can use.")
+        for name, listed_size, target in tqdm(kept, desc=slug):
+            if target.exists() and not FORCE and (listed_size is None or target.stat().st_size == listed_size):
+                continue
+            staging = WORK_DIR / "kaggle-one"
+            if staging.exists():
+                shutil.rmtree(staging)
+            staging.mkdir(parents=True)
+            completed = subprocess.run(
+                ["kaggle", "datasets", "download", "-d", slug, "-f", name, "-p", str(staging), "--quiet"],
+                capture_output=True, text=True,
+            )
+            if completed.returncode != 0:
+                detail = (completed.stderr or completed.stdout or "").strip()[-400:]
+                raise RuntimeError(f"Download failed for {name} from {slug}. Files already stored on Drive were kept. {detail}")
+            downloaded = [item for item in staging.rglob("*") if item.is_file()]
+            if len(downloaded) != 1:
+                raise RuntimeError(f"Expected one downloaded file for {name}, found {[item.name for item in downloaded]}.")
+            payload = downloaded[0]
+            if payload.suffix.lower() == ".zip":
+                with zipfile.ZipFile(payload) as archive:
+                    members = [item for item in archive.namelist() if not item.endswith("/")]
+                    if len(members) != 1:
+                        raise RuntimeError(f"{name} unpacked to {members}. The zip was left in {staging} and was not copied to Drive.")
+                    archive.extract(members[0], staging / "unpacked")
+                payload = staging / "unpacked" / members[0]
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(payload), target)
+            shutil.rmtree(staging, ignore_errors=True)
+            if listed_size is not None and target.stat().st_size != listed_size:
+                raise RuntimeError(f"Size mismatch for {target.name}. Kaggle lists {listed_size} bytes, Drive has {target.stat().st_size} bytes.")
+        print("stored", kind, "files", len(kept), "under", RAW_DIR)
+    checksum_path = DATA_DIR / "inventory" / "iscx-SHA256SUMS.txt"
+    if checksum_path.exists():
+        expected = {}
+        for line in checksum_path.read_text(encoding="utf-8", errors="replace").splitlines():
+            parts = line.split()
+            if len(parts) >= 2 and len(parts[0]) == 64:
+                expected[Path(parts[-1].lstrip("*")).name] = parts[0].lower()
+        checked = 0
+        for capture in (RAW_DIR / "iscx").rglob("*"):
+            if not capture.is_file() or capture.suffix.lower() not in {".pcap", ".pcapng"}:
+                continue
+            digest = expected.get(capture.name)
+            if digest is None:
+                print("no_sha256_line", capture.name)
+                continue
+            actual = sha256_file(capture)
+            if actual != digest:
+                raise RuntimeError(f"SHA256 mismatch for {capture.name}. expected {digest} actual {actual}")
+            checked += 1
+        print("sha256_checked", checked)
+    else:
+        print("ISCX SHA256SUMS.txt was not in the Kaggle file list. Sizes were checked against the listing. No checksum was invented.")
 elif DATA_SOURCE == "url":
     import urllib.request
     for name, url in DIRECT_URLS.items():
