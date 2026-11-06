@@ -1,0 +1,4 @@
+# Reproduction preset. These match configs/default.yaml.
+flow:
+  active_timeout_s: 120
+  idle_timeout_s: 5

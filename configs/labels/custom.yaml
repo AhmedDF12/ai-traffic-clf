@@ -1,0 +1,24 @@
+version: 1
+services:
+  - streaming
+  - voip
+  - browsing
+  - file_transfer
+  - chat
+  - gaming
+notes: >
+  The sidecar is the ground truth for self-capture. An application is accepted
+  only with a service listed here, so a Zoom session labeled as streaming fails
+  instead of creating a new class. WhatsApp and Telegram may be chat or a call.
+applications:
+  browser: [browsing]
+  youtube: [streaming]
+  netflix: [streaming]
+  spotify: [streaming]
+  vimeo: [streaming]
+  zoom: [voip]
+  whatsapp: [chat, voip]
+  telegram: [chat, voip]
+  facebook: [chat, voip, browsing]
+  file_download: [file_transfer]
+  gaming: [gaming]

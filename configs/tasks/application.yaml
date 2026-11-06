@@ -1,0 +1,42 @@
+version: 1
+name: application
+secondary: false
+dataset: iscx_vpn
+label_map: configs/labels/iscx_vpn.yaml
+label_field: application
+classes:
+  - youtube
+  - netflix
+  - vimeo
+  - spotify
+  - skype
+  - facebook
+  - hangouts
+  - aim
+  - icq
+  - voipbuster
+  - browser
+  - ftps
+  - sftp
+  - scp
+  - bittorrent
+  - email
+  - zoom
+  - whatsapp
+  - telegram
+  - file_download
+  - gaming
+custom_only_classes:
+  - zoom
+  - whatsapp
+  - telegram
+  - file_download
+  - gaming
+excluded_from_task: []
+extra_sources:
+  - custom
+evaluation_sources: []
+notes: >
+  Primary task. email is the ISCX mail capture, not a Gmail-only class.
+  bittorrent remains an application even though the service head excludes P2P.
+  zoom, whatsapp, telegram, file_download, and gaming come only from self-capture.

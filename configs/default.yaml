@@ -1,0 +1,45 @@
+version: 1
+project_name: ai-traffic-clf
+seed: 42
+
+paths:
+  data_root: data
+  raw: data/raw
+  interim: data/interim
+  processed: data/processed
+  reports: reports
+  mlruns: mlruns
+
+# CICFlowMeter-compatible timeouts. Use configs/presets/live.yaml for your own captures.
+flow:
+  active_timeout_s: 120
+  idle_timeout_s: 5
+  early_packets: 30
+
+privacy:
+  allow_tls_metadata: false
+  strip_payload: true
+
+features:
+  flow_spec: configs/features/flow_v1.yaml
+  sequence_spec: configs/features/sequence_v1.yaml
+  use_ports: false
+  use_sni: false
+
+# SQLite, not the old mlruns folder. MLflow 3 rejects that folder as a tracking store.
+mlflow:
+  tracking_uri: sqlite:///mlruns/mlflow.db
+  experiment_name: traffic-clf
+
+runtime:
+  device: cpu
+  n_jobs: 1
+
+labels:
+  iscx_vpn: configs/labels/iscx_vpn.yaml
+  cic_ids2017: configs/labels/cic_ids2017.yaml
+  cic_ids2018: configs/labels/cic_ids2018.yaml
+  custom: configs/labels/custom.yaml
+
+splits:
+  cic_ids2017: configs/splits/cic_ids2017.yaml

@@ -1,0 +1,50 @@
+version: 1
+dataset: cic_ids2018
+absent_classes:
+  - port_scan
+notes: >
+  Two vocabularies appear in public copies. The AWS processed CICFlowMeter
+  files use names such as "DoS attacks-Hulk" and the misspelling
+  "Infilteration". Some relabeled copies use "DoS Hulk" and "Botnet Ares".
+  A trailing "- Attempted" is stripped, so both forms share a class.
+  "Brute Force -XSS" is the web XSS attack and joins malware, matching the
+  CIC-IDS2017 web-attack bucket. There is no dedicated port-scan class.
+map:
+  benign:
+    - Benign
+  ddos:
+    - DDoS attack-HOIC
+    - DDoS attack-LOIC-UDP
+    - DDoS attacks-LOIC-HTTP
+    - DDoS-HOIC
+    - DDoS-LOIC-UDP
+    - DDoS-LOIC-HTTP
+    - DoS attacks-GoldenEye
+    - DoS attacks-Hulk
+    - DoS attacks-SlowHTTPTest
+    - DoS attacks-Slowloris
+    - DoS GoldenEye
+    - DoS Hulk
+    - DoS Slowhttptest
+    - DoS slowloris
+  brute_force:
+    - FTP-BruteForce
+    - SSH-Bruteforce
+    - Brute Force -Web
+    - Brute Force - Web
+    - Web Attack - Brute Force
+  botnet:
+    - Bot
+    - Botnet Ares
+  malware:
+    - Infilteration
+    - Infiltration
+    - SQL Injection
+    - Heartbleed
+    - Brute Force -XSS
+    - Brute Force - XSS
+    - Web Attack - XSS
+    - Web Attack - SQL
+    - Infiltration - NMAP Portscan
+    - Infiltration - Dropbox Download
+    - Infiltration - Communication Victim Attacker

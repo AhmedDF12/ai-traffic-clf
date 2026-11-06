@@ -1,0 +1,3 @@
+# Longer idle timeout for a live capture, so a short pause does not split one call.
+flow:
+  idle_timeout_s: 15

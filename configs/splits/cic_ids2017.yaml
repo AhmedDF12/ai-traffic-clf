@@ -1,0 +1,20 @@
+version: 1
+dataset: cic_ids2017
+unit: capture_file
+notes: >
+  Day split for the official MachineLearningCVE filenames, including the
+  spellings Wednesday-workingHours, Infilteration, and DDos. Monday is
+  benign only and is a false-positive check, not training data. Friday
+  morning is validation. Friday afternoon is test. This is not a random
+  row split: every flow inherits its file's split.
+assignments:
+  Monday-WorkingHours.pcap_ISCX.csv: fp_check
+  Tuesday-WorkingHours.pcap_ISCX.csv: train
+  Wednesday-workingHours.pcap_ISCX.csv: train
+  Thursday-WorkingHours-Morning-WebAttacks.pcap_ISCX.csv: train
+  Thursday-WorkingHours-Afternoon-Infilteration.pcap_ISCX.csv: train
+  Friday-WorkingHours-Morning.pcap_ISCX.csv: validation
+  Friday-WorkingHours-Afternoon-PortScan.pcap_ISCX.csv: test
+  Friday-WorkingHours-Afternoon-DDos.pcap_ISCX.csv: test
+aliases:
+  Wednesday-WorkingHours.pcap_ISCX.csv: Wednesday-workingHours.pcap_ISCX.csv

@@ -1,0 +1,14 @@
+# Free Colab runtime. GPU is unused until the sequence model. The runtime disk
+# is erased when the session ends, so download mlruns before closing it.
+runtime:
+  device: cuda
+paths:
+  data_root: /content/ai-traffic-clf/data
+  raw: /content/ai-traffic-clf/data/raw
+  interim: /content/ai-traffic-clf/data/interim
+  processed: /content/ai-traffic-clf/data/processed
+  reports: /content/ai-traffic-clf/reports
+  mlruns: /content/ai-traffic-clf/mlruns
+mlflow:
+  tracking_uri: sqlite:////content/ai-traffic-clf/mlruns/mlflow.db
+  experiment_name: traffic-clf

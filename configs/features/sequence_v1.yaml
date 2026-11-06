@@ -1,0 +1,6 @@
+version: 1
+# First-N packet contract. The running value is flow.early_packets in default.yaml.
+# An overlay may change that value for an ablation. The sequence builder, added
+# in a later module, must read flow.early_packets.
+packets: 30
+fields: [size, direction, iat]

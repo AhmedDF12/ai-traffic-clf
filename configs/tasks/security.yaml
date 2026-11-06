@@ -1,0 +1,21 @@
+version: 1
+name: security
+secondary: true
+dataset: cic_ids2017
+label_map: configs/labels/cic_ids2017.yaml
+label_field: security
+classes:
+  - benign
+  - ddos
+  - brute_force
+  - port_scan
+  - botnet
+  - malware
+custom_only_classes: []
+excluded_from_task: []
+extra_sources: []
+evaluation_sources:
+  - cic_ids2018
+notes: >
+  Secondary task. Train on CIC-IDS2017 CSV files. CSE-CIC-IDS2018 is held out.
+  Do not mix these rows with ISCX application labels.

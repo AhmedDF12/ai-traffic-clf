@@ -1,0 +1,24 @@
+version: 1
+name: service
+secondary: false
+dataset: iscx_vpn
+label_map: configs/labels/iscx_vpn.yaml
+label_field: service
+classes:
+  - streaming
+  - voip
+  - browsing
+  - file_transfer
+  - chat
+  - gaming
+custom_only_classes:
+  - gaming
+excluded_from_task:
+  - email
+  - p2p
+extra_sources:
+  - custom
+evaluation_sources: []
+notes: >
+  Primary task. Email and P2P stay in the capture set but are dropped from
+  this head. Gaming exists only in self-captured sessions.

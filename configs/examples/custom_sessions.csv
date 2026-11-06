@@ -1,0 +1,4 @@
+file,t_start,t_end,application,service,vpn,host,notes
+youtube_a.pcap,2026-11-06T12:00:00Z,2026-11-06T12:10:00Z,youtube,streaming,no,lab-laptop,one tab
+browser_a.pcap,2026-11-06T12:20:00Z,2026-11-06T12:30:00Z,browser,browsing,no,lab-laptop,news site
+zoom_a.pcap,2026-11-06T13:00:00Z,2026-11-06T13:10:00Z,zoom,voip,yes,lab-laptop,test call

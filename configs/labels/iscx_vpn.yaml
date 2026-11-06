@@ -1,0 +1,92 @@
+version: 1
+dataset: iscx_vpn
+notes: >
+  First matching rule wins. The VPN flag comes from a vpn_ filename prefix or
+  from a VPN directory. A NonVPN directory is not VPN. Email and P2P are kept
+  as applications and excluded from the six-way service task. Facebook and
+  Hangouts video files are calls, so they map to voip. Netflix, Spotify, SCP,
+  and VoipBuster are included because those filenames ship in the capture
+  dump; the short UNB category paragraph names a slightly smaller set.
+rules:
+  - id: youtube
+    pattern: '(?:^|[_-])youtube'
+    application: youtube
+    service: streaming
+  - id: netflix
+    pattern: '(?:^|[_-])netflix'
+    application: netflix
+    service: streaming
+  - id: spotify
+    pattern: '(?:^|[_-])spotify'
+    application: spotify
+    service: streaming
+  - id: vimeo
+    pattern: '(?:^|[_-])vimeo'
+    application: vimeo
+    service: streaming
+  - id: skype_file
+    pattern: 'skype[_-]?files?'
+    application: skype
+    service: file_transfer
+  - id: skype_chat
+    pattern: 'skype[_-]?chat'
+    application: skype
+    service: chat
+  - id: skype_call
+    pattern: 'skype[_-]?(?:audio|video|voice)'
+    application: skype
+    service: voip
+  - id: hangouts_chat
+    pattern: 'hangouts?[_-]?chat'
+    application: hangouts
+    service: chat
+  - id: hangouts_call
+    pattern: 'hangouts?[_-]?(?:audio|video|voice)'
+    application: hangouts
+    service: voip
+  - id: facebook_chat
+    pattern: 'facebook[_-]?chat'
+    application: facebook
+    service: chat
+  - id: facebook_call
+    pattern: 'facebook[_-]?(?:audio|video|voice)'
+    application: facebook
+    service: voip
+  - id: aim
+    pattern: '(?:^|[_-])aim(?:[_-]?chat)?(?:[_-]|\d|$)'
+    application: aim
+    service: chat
+  - id: icq
+    pattern: '(?:^|[_-])icq'
+    application: icq
+    service: chat
+  - id: voipbuster
+    pattern: 'voip[_-]?buster'
+    application: voipbuster
+    service: voip
+  - id: ftps
+    pattern: '(?:^|[_-])ftps'
+    application: ftps
+    service: file_transfer
+  - id: sftp
+    pattern: '(?:^|[_-])sftp'
+    application: sftp
+    service: file_transfer
+  - id: scp
+    pattern: '(?:^|[_-])scp(?:down|up)?(?:[_-]|\d|$)'
+    application: scp
+    service: file_transfer
+  - id: bittorrent
+    pattern: '(?:^|[_-])(?:bittorrent|utorrent|transmission|torrent|vuze)(?:[_-]|\d|$)'
+    application: bittorrent
+    service: null
+    exclude: p2p
+  - id: email
+    pattern: 'gmail|(?:^|[_-])email(?:[_-]|\d|$)'
+    application: email
+    service: null
+    exclude: email
+  - id: browser
+    pattern: '(?:^|[_-])(?:browsing|browser)'
+    application: browser
+    service: browsing
