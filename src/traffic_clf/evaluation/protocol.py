@@ -140,6 +140,46 @@ def assign_within_day(
     return assigned
 
 
+def experiment_source(meta: pd.DataFrame) -> pd.Series:
+    """Collapse dataset labels to iscx, vlc, or custom.
+
+    VLC files are stored as source ``custom``. A ``vlc-`` host, or a VLC
+    filename prefix, keeps them separate from a lab capture.
+    """
+    source = meta["source_dataset"].astype(str) if "source_dataset" in meta.columns else pd.Series("unknown", index=meta.index)
+    host = meta["host"].astype(str) if "host" in meta.columns else pd.Series("", index=meta.index)
+    names = meta["capture_file"].map(lambda value: Path(str(value)).name.casefold()) if "capture_file" in meta.columns else pd.Series("", index=meta.index)
+    prefixes = ("youtube_", "netflix_", "spotify_", "web_", "roblox_", "prime_", "teams_")
+    labels = []
+    for src, host_name, file_name in zip(source, host, names, strict=True):
+        if src == "iscx_vpn":
+            labels.append("iscx")
+        elif str(host_name).startswith("vlc-") or str(file_name).startswith(prefixes):
+            labels.append("vlc")
+        elif src == "custom":
+            labels.append("custom")
+        else:
+            labels.append(src)
+    return pd.Series(labels, index=meta.index, dtype="object")
+
+
+def class_source_control(meta: pd.DataFrame) -> list[dict[str, object]]:
+    """Mark every class that has captures from only one source."""
+    sources = experiment_source(meta)
+    rows = []
+    for label, part in meta.groupby(meta["label"].astype(str), sort=False):
+        names = sorted(set(sources.loc[part.index].astype(str)))
+        rows.append(
+            {
+                "class": str(label),
+                "sources": names,
+                "files": int(part["capture_id"].nunique()) if "capture_id" in part.columns else int(part["capture_file"].nunique()),
+                "environment_confounded": len(names) < 2,
+            }
+        )
+    return rows
+
+
 def dominance(meta: pd.DataFrame, split_name: str) -> dict[str, object]:
     """Say whether one capture or one class is more than half of a split."""
     part = meta.loc[meta["split"] == split_name]
@@ -218,8 +258,11 @@ def run_capture_protocol(
     """
     frame, labels = _prepare_frames(features, meta)
     labels = _attach_host(labels, sessions)
+    labels["experiment_source"] = experiment_source(labels)
     inventory = environment_inventory(labels, sessions)
     environment = _environment_audit(frame, labels, seed=seed)
+    control = class_source_control(labels)
+    confounded = {str(row["class"]): bool(row["environment_confounded"]) for row in control}
     experiments = []
     for capped, experiment in ((False, "file_split_uncapped"), (True, f"file_split_cap_{max_flows_per_capture}")):
         used_features, used_meta = (frame, labels)
@@ -238,6 +281,7 @@ def run_capture_protocol(
                 seed=seed,
                 n_jobs=n_jobs,
                 out=out,
+                confounded=confounded,
             )
         )
         experiments.append(
@@ -258,13 +302,316 @@ def run_capture_protocol(
         "tuned": False,
         "environment_inventory": inventory.to_dict(orient="records"),
         "environment_audit": environment,
+        "class_source_control": control,
         "experiments": experiments,
+        "headline": None,
+        "headline_reason": "File-split scores that mix ISCX and VLC are not a headline. Read iscx_only, vlc_only, and cross_source separately.",
     }
     destination = Path(out)
     destination.mkdir(parents=True, exist_ok=True)
     (destination / f"{task}_protocol.json").write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     _print_protocol(payload)
     return payload
+
+
+def run_source_protocol(
+    features: pd.DataFrame,
+    meta: pd.DataFrame,
+    spec: FeatureSpec,
+    *,
+    task: str,
+    seed: int,
+    n_jobs: int,
+    max_flows_per_capture: int,
+    out: Path,
+    sessions: pd.DataFrame | None = None,
+    model_names: tuple[str, ...] = COMPARE_MODELS,
+) -> dict[str, object]:
+    """Score ISCX-only, VLC-only, and the ISCX-to-VLC transfer separately.
+
+    A class that exists in one source is marked environment-confounded.
+    The adversarial check trains only when at least two classes have two sources.
+    """
+    frame, labels = _prepare_frames(features, meta)
+    labels = _attach_host(labels, sessions)
+    labels["experiment_source"] = experiment_source(labels)
+    control = class_source_control(labels)
+    confounded = {str(row["class"]): bool(row["environment_confounded"]) for row in control}
+    experiments: list[dict[str, object]] = []
+    present = sorted(set(labels["experiment_source"].astype(str)))
+    for source_name in ("iscx", "vlc"):
+        mask = labels["experiment_source"] == source_name
+        if int(mask.sum()) == 0:
+            experiments.append(
+                {
+                    "experiment": f"{source_name}_only",
+                    "status": "no rows",
+                    "headline": False,
+                    "classes": [],
+                }
+            )
+            continue
+        part_features = frame.loc[mask].reset_index(drop=True)
+        part_meta = labels.loc[mask].reset_index(drop=True)
+        for capped in (False, True):
+            used_features, used_meta = (part_features, part_meta)
+            suffix = "uncapped"
+            if capped:
+                used_features, used_meta = cap_flows_per_capture(
+                    part_features,
+                    part_meta,
+                    max_flows_per_capture,
+                    seed=seed,
+                    capture_column="capture_id",
+                )
+                suffix = f"cap_{max_flows_per_capture}"
+            scored = _score_file_split(
+                used_features,
+                used_meta,
+                spec,
+                task=task,
+                experiment=f"{source_name}_only_file_split_{suffix}",
+                model_names=model_names,
+                seed=seed,
+                n_jobs=n_jobs,
+                out=out,
+                confounded=confounded,
+            )
+            scored["headline"] = _test_headline(scored)
+            experiments.append(scored)
+            kfold = _score_group_kfold(
+                used_features,
+                used_meta,
+                spec,
+                task=task,
+                experiment=f"{source_name}_only_group_kfold_5_{suffix}",
+                seed=seed,
+                n_jobs=n_jobs,
+            )
+            experiments.append(kfold)
+    if "custom" in present:
+        experiments.append(
+            {
+                "experiment": "custom_only",
+                "status": "lab captures are separate from VLC and were not mixed into vlc_only",
+                "rows": int((labels["experiment_source"] == "custom").sum()),
+                "headline": False,
+            }
+        )
+    experiments.append(
+        _cross_source(
+            frame,
+            labels,
+            spec,
+            task=task,
+            seed=seed,
+            n_jobs=n_jobs,
+            out=out,
+            confounded=confounded,
+        )
+    )
+    experiments.append(
+        _adversarial_source_balance(
+            frame,
+            labels,
+            spec,
+            task=task,
+            seed=seed,
+            n_jobs=n_jobs,
+            out=out,
+            confounded=confounded,
+        )
+    )
+    payload = {
+        "task": task,
+        "seed": seed,
+        "tuned": False,
+        "max_flows_per_capture": max_flows_per_capture,
+        "headline": None,
+        "headline_reason": "ISCX-only, VLC-only, and cross-source are separate experiments.",
+        "class_source_control": control,
+        "experiments": experiments,
+    }
+    destination = Path(out)
+    destination.mkdir(parents=True, exist_ok=True)
+    (destination / f"{task}_source.json").write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    _print_source(payload)
+    return payload
+
+
+def _test_headline(block: dict[str, object]) -> bool:
+    models = block.get("models")
+    if not isinstance(models, list) or not models:
+        return False
+    splits = models[0].get("splits", {})
+    if not isinstance(splits, dict):
+        return False
+    test = splits.get("test", {})
+    return bool(test.get("headline", False)) if isinstance(test, dict) else False
+
+
+def _cross_source(
+    features: pd.DataFrame,
+    meta: pd.DataFrame,
+    spec: FeatureSpec,
+    *,
+    task: str,
+    seed: int,
+    n_jobs: int,
+    out: Path,
+    confounded: dict[str, bool],
+) -> dict[str, object]:
+    shared = [
+        str(row["class"])
+        for row in class_source_control(meta)
+        if "iscx" in row["sources"] and "vlc" in row["sources"]
+    ]
+    experiment = "cross_source_iscx_train_vlc_test"
+    if len(shared) < 2:
+        reason = (
+            "no class is present in both ISCX and VLC"
+            if not shared
+            else f"only one shared class ({shared[0]}); a classifier was not trained"
+        )
+        return {"experiment": experiment, "status": reason, "shared_classes": shared, "headline": False}
+    mask = meta["label"].astype(str).isin(shared) & meta["experiment_source"].isin(["iscx", "vlc"])
+    part_features = features.loc[mask].reset_index(drop=True)
+    part_meta = meta.loc[mask].reset_index(drop=True).copy()
+    part_meta["split"] = "train"
+    part_meta.loc[part_meta["experiment_source"] == "vlc", "split"] = "test"
+    rng = np.random.default_rng(seed)
+    iscx_rows = part_meta["experiment_source"] == "iscx"
+    for _, group in part_meta.loc[iscx_rows].groupby("label", sort=False):
+        files = list(dict.fromkeys(group["capture_id"].astype(str)))
+        if len(files) < 3:
+            continue
+        hold = files[int(rng.integers(0, len(files)))]
+        part_meta.loc[part_meta["capture_id"].astype(str) == hold, "split"] = "validation"
+    scored = _fit_split_models(
+        part_features,
+        part_meta,
+        spec,
+        model_names=("random_forest",),
+        seed=seed,
+        n_jobs=n_jobs,
+        out=out,
+        task=task,
+        experiment=experiment,
+        confounded=confounded,
+    )
+    scored["shared_classes"] = shared
+    scored["headline"] = False
+    for model in scored.get("models", []):
+        for block in model.get("splits", {}).values():
+            block["headline"] = False
+            block["dominance"]["headline"] = False
+            block["dominance"]["reason"] = "transfer experiment: train is ISCX and test is VLC"
+    return scored
+
+
+def _adversarial_source_balance(
+    features: pd.DataFrame,
+    meta: pd.DataFrame,
+    spec: FeatureSpec,
+    *,
+    task: str,
+    seed: int,
+    n_jobs: int,
+    out: Path,
+    confounded: dict[str, bool],
+) -> dict[str, object]:
+    """Train only on classes that have two sources, holding one file out of each multi-file source."""
+    experiment = "adversarial_source_balanced"
+    rng = np.random.default_rng(seed)
+    eligible: list[str] = []
+    test_ids: set[str] = set()
+    for label, part in meta.groupby(meta["label"].astype(str), sort=False):
+        by_source: dict[str, list[str]] = {}
+        for capture_id, rows in part.groupby("capture_id", sort=False):
+            found = sorted(set(meta.loc[rows.index, "experiment_source"].astype(str)))
+            if len(found) == 1:
+                by_source.setdefault(found[0], []).append(str(capture_id))
+        if len(by_source) < 2:
+            continue
+        train_sources: set[str] = set()
+        held: list[str] = []
+        for files in by_source.values():
+            ordered = list(files)
+            if len(ordered) >= 2:
+                pick = int(rng.integers(0, len(ordered)))
+                held.append(ordered.pop(pick))
+                train_sources.add("kept")
+            elif ordered:
+                train_sources.add("kept")
+        # A source that contributed only its held-out file would leave train one-sided.
+        # Recount sources that still have a training file.
+        remaining: set[str] = set()
+        for source_name, files in by_source.items():
+            if any(file_name not in held for file_name in files):
+                remaining.add(source_name)
+        if len(remaining) >= 2 and held:
+            eligible.append(str(label))
+            test_ids.update(held)
+    if len(eligible) < 2:
+        status = (
+            "none exists"
+            if not eligible
+            else "one class has two sources, which cannot train a classifier"
+        )
+        return {"experiment": experiment, "status": status, "classes": eligible, "headline": False}
+    mask = meta["label"].astype(str).isin(eligible)
+    part_features = features.loc[mask].reset_index(drop=True)
+    part_meta = meta.loc[mask].reset_index(drop=True).copy()
+    part_meta["split"] = "train"
+    part_meta.loc[part_meta["capture_id"].astype(str).isin(test_ids), "split"] = "test"
+    scored = _fit_split_models(
+        part_features,
+        part_meta,
+        spec,
+        model_names=("random_forest",),
+        seed=seed,
+        n_jobs=n_jobs,
+        out=out,
+        task=task,
+        experiment=experiment,
+        confounded=confounded,
+    )
+    scored["classes"] = eligible
+    scored["headline"] = False
+    for model in scored.get("models", []):
+        for block in model.get("splits", {}).values():
+            block["headline"] = False
+            reason = "adversarial check on classes that have two capture sources"
+            block["dominance"]["headline"] = False
+            block["dominance"]["reason"] = reason
+    return scored
+
+
+def _print_source(payload: dict[str, object]) -> None:
+    print("task", payload["task"], "source experiments", "tuned", payload["tuned"])
+    for row in payload["class_source_control"]:
+        flag = " environment-confounded" if row["environment_confounded"] else ""
+        print(" class", row["class"], "sources", row["sources"], "files", row["files"], flag)
+    for experiment in payload["experiments"]:
+        print("experiment", experiment.get("experiment"), "headline", experiment.get("headline", False))
+        if experiment.get("status"):
+            print(" ", experiment["status"])
+        if experiment.get("error"):
+            print(" ", experiment["error"])
+        if "folds" in experiment:
+            print(
+                " group_kfold macro_f1",
+                _format_mean(experiment.get("macro_f1_mean"), experiment.get("macro_f1_std")),
+                "largest_file",
+                experiment.get("largest_file"),
+                "fold",
+                experiment.get("largest_file_fold"),
+                "fold_macro_f1",
+                experiment.get("largest_file_fold_macro_f1"),
+            )
+            continue
+        if experiment.get("models"):
+            _print_model_block(experiment)
 
 
 def run_security_protocol(
@@ -350,6 +697,22 @@ def _prepare_frames(
     return frame, labels
 
 
+def _source_aware_dominance(meta: pd.DataFrame, split_name: str) -> dict[str, object]:
+    """A split that mixes capture sources is not a headline."""
+    note = dominance(meta, split_name)
+    part = meta.loc[meta["split"] == split_name]
+    if part.empty or "experiment_source" not in part.columns and "source_dataset" not in part.columns:
+        return note
+    names = sorted(set(experiment_source(part).astype(str)))
+    note = dict(note)
+    note["sources"] = names
+    if len(names) > 1:
+        extra = "split mixes capture sources: " + ", ".join(names)
+        note["headline"] = False
+        note["reason"] = f"{note['reason']}; {extra}" if note.get("reason") else extra
+    return note
+
+
 def _score_file_split(
     features: pd.DataFrame,
     meta: pd.DataFrame,
@@ -361,6 +724,7 @@ def _score_file_split(
     seed: int,
     n_jobs: int,
     out: Path,
+    confounded: dict[str, bool] | None = None,
 ) -> dict[str, object]:
     groups = _groups(meta)
     try:
@@ -379,6 +743,7 @@ def _score_file_split(
         out=out,
         task=task,
         experiment=experiment,
+        confounded=confounded,
     )
 
 
@@ -389,18 +754,19 @@ def _fit_split_models(
     *,
     model_names: tuple[str, ...],
     seed: int,
-        n_jobs: int,
-        out: Path | None,
-        task: str,
-        experiment: str,
-    ) -> dict[str, object]:
+    n_jobs: int,
+    out: Path | None,
+    task: str,
+    experiment: str,
+    confounded: dict[str, bool] | None = None,
+) -> dict[str, object]:
     train_mask = meta["split"] == "train"
     if int(train_mask.sum()) == 0 or meta.loc[train_mask, "label"].nunique() < 2:
         return {"experiment": experiment, "task": task, "error": "training split cannot fit a classifier", "headline": False}
     state = fit_preprocess(features.loc[train_mask], spec)
     transformed = state.transform(features)
     blocks = []
-    notes = {name: dominance(meta, name) for name in ("validation", "test")}
+    notes = {name: _source_aware_dominance(meta, name) for name in ("validation", "test")}
     for model_name in model_names:
         model = build_model(model_name, seed=seed, n_jobs=n_jobs)
         fitted = fit_estimator(model, model_name, transformed.loc[train_mask], meta.loc[train_mask, "label"])
@@ -418,6 +784,10 @@ def _fit_split_models(
             per_class.pop("accuracy", None)
             per_class.pop("macro avg", None)
             per_class.pop("weighted avg", None)
+            for label, scores in list(per_class.items()):
+                if isinstance(scores, dict):
+                    flagged = bool(confounded.get(str(label), False)) if confounded else False
+                    scores["environment_confounded"] = flagged
             file_recall = _file_mean_recall(meta.loc[mask], pred)
             note = notes.get(split_name, {"headline": False, "reason": "not a holdout split"})
             model_block["splits"][split_name] = {
@@ -716,9 +1086,11 @@ def _print_model_block(experiment: dict[str, object]) -> None:
                 print(" dominance", block["dominance"]["reason"])
             for label, scores in block["per_class"].items():
                 if isinstance(scores, dict) and "f1-score" in scores:
+                    flag = " environment-confounded" if scores.get("environment_confounded") else ""
                     print(
                         f"  class={label} precision={scores['precision']:.4f} "
-                        f"recall={scores['recall']:.4f} f1={scores['f1-score']:.4f} support={scores['support']}"
+                        f"recall={scores['recall']:.4f} f1={scores['f1-score']:.4f} "
+                        f"support={scores['support']}{flag}"
                     )
 
 

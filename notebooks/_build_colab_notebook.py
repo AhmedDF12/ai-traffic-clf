@@ -71,7 +71,7 @@ FORCE = False
 SUBSET_MAX_ROWS = None  # set an integer such as 20000 for a first CIC pass
 TRIALS = 50
 RUN_SEARCH = False  # True runs the 50-trial booster search and scores test there
-RUN_EXTRA = False  # ablations, five seeds, cross-dataset, SHAP
+RUN_EXTRA = True  # source splits, ablations, five seeds, latency, SHAP
 RUN_NEURAL = False
 
 if not GITHUB_REPO_URL.startswith("https://") or "github.com" not in GITHUB_REPO_URL:
@@ -1224,13 +1224,13 @@ else:
 add(
     "markdown",
     """
-## 9. Ablations, cross-dataset, seeds, latency, and SHAP
+## 9. Source splits, ablations, seeds, latency, and SHAP
 
-These steps are off until you set `RUN_EXTRA = True`. They are the part most likely to exceed a free Colab session: four idle timeouts re-read the packet captures, and five seeds refit the chosen model. Each ablation writes its own directory. The printed number is validation macro-F1. `train_prepared` also stores that directory's test score once. Do not use those test scores to pick a timeout or to start another search on the closed service test set.
+`RUN_EXTRA` is true. This cell does not tune. ISCX-only, VLC-only, and the ISCX-to-VLC transfer are separate experiments. A class that exists in only one source is marked environment-confounded. If no class exists in two sources, the adversarial check says none exists.
 
-Neural sequence models are not in this repository. `RUN_NEURAL = True` stops with that fact. It does not switch boosting onto the GPU.
+The model for the ablations is the library default with the highest validation macro-F1 inside that source on the capped file split. Feature groups and the first-N packet prefixes reuse the unscaled table. Five seeds report validation macro-F1 as mean ± std. Latency is one predict call. SHAP writes a CSV per task and source.
 
-The cross-dataset cell trains on ISCX captures only and scores your custom captures with the same class names. It stops if you have not uploaded custom captures. SHAP is installed in this section, not before, and the plots are written under `DATA_DIR/reports/shap`.
+The idle-timeout loop is last. It re-reads the captures at 5, 15, 30, and 60 seconds. A finished timeout is skipped.
 """,
 )
 
@@ -1240,184 +1240,220 @@ add(
 if RUN_NEURAL:
     raise RuntimeError("Sequence neural models are not in this repository. No GPU training was run. Boosting remains on CPU. Set RUN_NEURAL = False to continue with the steps that exist.")
 if not RUN_EXTRA:
-    print(
-        "Ablations, cross-dataset evaluation, repeated seeds, latency, and SHAP did not run. "
-        "RUN_EXTRA is false. No extra number was computed."
-    )
+    print("Source splits, ablations, seeds, latency, and SHAP did not run. RUN_EXTRA is false.")
     section_end(
         "extra",
         "skipped because RUN_EXTRA is false",
         [],
-        "no ablation, seed, latency, or SHAP number was computed",
+        "no source-split or ablation number was computed",
         "copy reports and models to Drive",
     )
 else:
     import json
-    import time
-    from pathlib import Path
-    
-    import numpy as np
+    import subprocess
+    import sys
+
     import pandas as pd
-    from scipy import stats
-    from sklearn.metrics import accuracy_score, f1_score
-    
+
     from traffic_clf.config import load_config
     from traffic_clf.data.labels import load_custom_spec
     from traffic_clf.data.loaders import load_custom_sidecar
+    from traffic_clf.evaluation.protocol import run_source_protocol
+    from traffic_clf.evaluation.sensitivity import (
+        best_model_by_source,
+        measure_latency,
+        run_early_packet_ablation,
+        run_feature_ablations,
+        run_seed_repetition,
+        score_source_cap,
+        write_shap,
+    )
     from traffic_clf.flows.pipeline import extract_custom_pcap, extract_iscx_pcap
-    from traffic_clf.preprocess.prepare import _prepare_capture_tables, load_preprocess_state, write_prepared
-    from traffic_clf.training.run import fit_estimator, load_trained_model, train_prepared
-    
-    CHOSEN = "lightgbm"
-    service_dir = DATA_DIR / "processed" / "service"
-    
-    
-    def prepared_iscx_only(task, idle, early, out):
-        if (out / "preprocess.joblib").exists() and not FORCE:
-            print("skip", out)
-            return
-        overlay = DRIVE_ROOT / f"overlay_{task}_{idle}_{early}.yaml"
-        write_overlay(overlay, idle=idle, early=early)
-        config = load_config(root=PROJECT_DIR, task=task, overlay=overlay)
-        tables = [extract_iscx_pcap(path, config) for path in iscx]
-        prepared = _prepare_capture_tables(tables, config)
-        out.mkdir(parents=True, exist_ok=True)
-        write_prepared(prepared, out)
-        print(prepared.report.summary())
-    
-    
-    def score_directory(task, data_dir, model_name, seed, params):
-        overlay = DRIVE_ROOT / f"overlay_seed_{seed}.yaml"
-        write_overlay(overlay, seed=seed)
-        config = load_config(root=PROJECT_DIR, task=task, overlay=overlay)
-        out = DATA_DIR / "reports" / "seeds" / task / f"{model_name}-seed-{seed}"
-        if (out / "metrics.json").exists() and not FORCE:
-            return json.loads((out / "metrics.json").read_text(encoding="utf-8"))["splits"]["validation"]["metrics"]["f1_macro"]
-        result = train_prepared(data_dir, config, model_name, out=out, params=params)
-        return result.validation.metrics["f1_macro"] if result.validation is not None else None
-    
-    
+
+    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "shap"], check=True)
+    extra_dir = DATA_DIR / "reports" / "protocol"
+    sessions = load_custom_sidecar(sidecar, root=PROJECT_DIR) if sidecar.exists() else None
+
+    def load_unscaled(task_name):
+        data_dir = DATA_DIR / "processed" / task_name
+        feature_path = data_dir / "unscaled_features.parquet"
+        meta_path = data_dir / "unscaled_meta.parquet"
+        if not feature_path.exists() or not meta_path.exists():
+            raise RuntimeError(f"{data_dir} has no unscaled tables. Run the evaluation protocol cell first.")
+        return pd.read_parquet(feature_path), pd.read_parquet(meta_path)
+
+    def validation_line(scored):
+        models = scored.get("models") or []
+        if not models:
+            return scored.get("status") or scored.get("error")
+        metrics = models[0].get("splits", {}).get("validation", {}).get("metrics", {})
+        return metrics.get("f1_macro")
+
+    summaries = []
+    for task_name in ("service", "application"):
+        features, meta = load_unscaled(task_name)
+        config = load_config(root=PROJECT_DIR, task=task_name, overlay=OVERLAY)
+        print("source protocol", task_name)
+        source_payload = run_source_protocol(
+            features,
+            meta,
+            config.features.flow,
+            task=task_name,
+            seed=config.seed,
+            n_jobs=config.runtime.n_jobs,
+            max_flows_per_capture=MAX_FLOWS_PER_CAPTURE,
+            out=extra_dir,
+            sessions=sessions,
+        )
+        chosen = best_model_by_source(source_payload, cap_label=f"cap_{MAX_FLOWS_PER_CAPTURE}")
+        print("best_validation_model", task_name, chosen)
+        task_summary = {"task": task_name, "best_model": chosen, "ablation": [], "seeds": [], "latency": [], "shap": []}
+        for source_name, model_name in chosen.items():
+            print("ablation", task_name, source_name, model_name)
+            grouped = run_feature_ablations(
+                features,
+                meta,
+                config.features.flow,
+                task=task_name,
+                source_name=source_name,
+                model_name=model_name,
+                seed=config.seed,
+                n_jobs=config.runtime.n_jobs,
+                max_flows_per_capture=MAX_FLOWS_PER_CAPTURE,
+                out=extra_dir,
+                sessions=sessions,
+            )
+            early = run_early_packet_ablation(
+                features,
+                meta,
+                config.features.flow,
+                task=task_name,
+                source_name=source_name,
+                model_name=model_name,
+                seed=config.seed,
+                n_jobs=config.runtime.n_jobs,
+                max_flows_per_capture=MAX_FLOWS_PER_CAPTURE,
+                out=extra_dir,
+                sessions=sessions,
+            )
+            for scored in [*grouped, *early]:
+                value = validation_line(scored)
+                print("experiment", scored.get("experiment"), "model", model_name, "headline", False, "validation_macro_f1", value)
+                task_summary["ablation"].append({"experiment": scored.get("experiment"), "model": model_name, "validation_macro_f1": value, "headline": False})
+            seeds = run_seed_repetition(
+                features,
+                meta,
+                config.features.flow,
+                task=task_name,
+                source_name=source_name,
+                model_name=model_name,
+                n_jobs=config.runtime.n_jobs,
+                max_flows_per_capture=MAX_FLOWS_PER_CAPTURE,
+                out=extra_dir,
+                sessions=sessions,
+            )
+            print(
+                "experiment", seeds["experiment"], "model", model_name, "headline", False,
+                "validation_macro_f1", seeds["validation_macro_f1"],
+                "mean", seeds["mean"], "std", seeds["std"],
+            )
+            task_summary["seeds"].append(seeds)
+            latency = measure_latency(
+                features,
+                meta,
+                config.features.flow,
+                task=task_name,
+                source_name=source_name,
+                model_name=model_name,
+                seed=config.seed,
+                n_jobs=config.runtime.n_jobs,
+                max_flows_per_capture=MAX_FLOWS_PER_CAPTURE,
+                sessions=sessions,
+            )
+            print(
+                "experiment", latency.get("experiment"), "model", model_name, "headline", False,
+                "rows", latency.get("rows"),
+                "latency_ms_per_flow", latency.get("latency_ms_per_flow"),
+                "throughput_flows_per_s", latency.get("throughput_flows_per_s"),
+            )
+            task_summary["latency"].append(latency)
+            shap_result = write_shap(
+                features,
+                meta,
+                config.features.flow,
+                task=task_name,
+                source_name=source_name,
+                model_name=model_name,
+                seed=config.seed,
+                n_jobs=config.runtime.n_jobs,
+                max_flows_per_capture=MAX_FLOWS_PER_CAPTURE,
+                out=extra_dir,
+                sessions=sessions,
+            )
+            print("experiment", shap_result.get("experiment"), "headline", False, "path", shap_result.get("path"), "status", shap_result.get("status"))
+            task_summary["shap"].append({key: shap_result.get(key) for key in ("experiment", "model", "path", "status", "top")})
+        summaries.append(task_summary)
+
     for idle in (5, 15, 30, 60):
-        prepared_iscx_only("service", idle, 30, DATA_DIR / "processed" / f"service-idle-{idle}")
-        overlay = DRIVE_ROOT / f"overlay_service_{idle}_30.yaml"
-        config = load_config(root=PROJECT_DIR, task="service", overlay=overlay)
-        out = DATA_DIR / "reports" / "ablation-idle" / str(idle)
-        if not (out / "metrics.json").exists() or FORCE:
-            result = train_prepared(DATA_DIR / "processed" / f"service-idle-{idle}", config, CHOSEN, out=out)
-            print("idle", idle, "validation_macro_f1", None if result.validation is None else result.validation.metrics["f1_macro"])
-    
-    for early in (5, 10, 20, 30):
-        prepared_iscx_only("service", 5, early, DATA_DIR / "processed" / f"service-early-{early}")
-        overlay = DRIVE_ROOT / f"overlay_service_5_{early}.yaml"
-        config = load_config(root=PROJECT_DIR, task="service", overlay=overlay)
-        out = DATA_DIR / "reports" / "ablation-early" / str(early)
-        if not (out / "metrics.json").exists() or FORCE:
-            result = train_prepared(DATA_DIR / "processed" / f"service-early-{early}", config, CHOSEN, out=out)
-            print("early_packets", early, "validation_macro_f1", None if result.validation is None else result.validation.metrics["f1_macro"])
-    
-    
-    def column_group(frame, group):
-        sequence = [column for column in frame.columns if column.startswith(("size_", "direction_", "iat_")) or column == "seq_observed"]
-        flow = [column for column in frame.columns if column not in sequence]
-        if group == "flow":
-            return frame.loc[:, flow]
-        if group == "sequence":
-            return frame.loc[:, sequence]
-        if group == "both":
-            return frame
-        raise RuntimeError(group)
-    
-    
-    base = DATA_DIR / "processed" / "service"
-    for group in ("flow", "sequence", "both"):
-        out = DATA_DIR / "processed" / f"service-group-{group}"
-        if not (out / "train_features.parquet").exists() or FORCE:
-            out.mkdir(parents=True, exist_ok=True)
-            for name in ("train", "validation", "test", "fp_check"):
-                features = pd.read_parquet(base / f"{name}_features.parquet")
-                meta = pd.read_parquet(base / f"{name}_meta.parquet")
-                column_group(features, group).to_parquet(out / f"{name}_features.parquet", index=False)
-                meta.to_parquet(out / f"{name}_meta.parquet", index=False)
-        overlay = write_overlay(DRIVE_ROOT / "drive_overlay.yaml")
-        config = load_config(root=PROJECT_DIR, task="service", overlay=overlay)
-        report = DATA_DIR / "reports" / "ablation-groups" / group
-        if not (report / "metrics.json").exists() or FORCE:
-            result = train_prepared(out, config, CHOSEN, out=report)
-            print(group, "validation_macro_f1", None if result.validation is None else result.validation.metrics["f1_macro"])
-    
-    if not custom or not sidecar.exists():
-        raise RuntimeError("Cross-dataset evaluation needs your custom captures and sessions.csv on Drive. ISCX was not scored against a substitute.")
-    cross_out = DATA_DIR / "processed" / "service-iscx-only"
-    prepared_iscx_only("service", 5, 30, cross_out)
-    config = load_config(root=PROJECT_DIR, task="service", overlay=OVERLAY)
-    result = train_prepared(cross_out, config, CHOSEN, out=DATA_DIR / "reports" / "cross" / "iscx-model")
-    model = load_trained_model(DATA_DIR / "reports" / "cross" / "iscx-model" / "model.joblib")
-    spec = load_custom_spec(config.labels.custom)
-    sessions = load_custom_sidecar(sidecar, spec)
-    custom_tables = [extract_custom_pcap(path, config, sessions, spec) for path in custom]
-    custom_features = pd.concat([table.features for table in custom_tables], ignore_index=True)
-    custom_sequence = pd.concat([table.sequence for table in custom_tables], ignore_index=True)
-    custom_meta = pd.concat([table.meta for table in custom_tables], ignore_index=True)
-    combined = pd.concat([custom_features, custom_sequence], axis=1)
-    keep_service = custom_meta["service"].notna()
-    combined = combined.loc[keep_service].reset_index(drop=True)
-    custom_meta = custom_meta.loc[keep_service].reset_index(drop=True)
-    state = load_preprocess_state(cross_out / "preprocess.joblib")
-    transformed = state.transform(combined)
-    keep = custom_meta["service"].astype(str).isin(model.classes)
-    if int((~keep).sum()):
-        print("custom_rows_outside_trained_classes", int((~keep).sum()))
-    scored = transformed.loc[keep.to_numpy()]
-    labels = custom_meta.loc[keep, "service"].astype(str)
-    pred = model.predict(scored)
-    print("cross_dataset_custom_macro_f1", float(f1_score(labels, pred, average="macro", zero_division=0)))
-    print("cross_dataset_custom_accuracy", float(accuracy_score(labels, pred)))
-    print("iscx_validation_macro_f1", None if result.validation is None else result.validation.metrics["f1_macro"])
-    
-    chosen_metrics = json.loads((DATA_DIR / "reports" / "service" / CHOSEN / "metrics.json").read_text(encoding="utf-8"))
-    params = {key: (float(value) if "." in str(value) else int(value)) for key, value in chosen_metrics["params"].items()}
-    seed_scores = [score_directory("service", service_dir, CHOSEN, seed, params) for seed in (42, 43, 44, 45, 46)]
-    seed_scores = [score for score in seed_scores if score is not None]
-    if len(seed_scores) < 5:
-        raise RuntimeError("Fewer than 5 seed scores were produced. The mean was not computed.")
-    mean = float(np.mean(seed_scores))
-    std = float(np.std(seed_scores, ddof=1))
-    half = float(stats.t.ppf(0.975, len(seed_scores) - 1) * std / np.sqrt(len(seed_scores)))
-    print("seed_macro_f1", seed_scores)
-    print("mean", mean, "std", std, "ci95", [mean - half, mean + half])
-    
-    model = load_trained_model(DATA_DIR / "reports" / "service" / CHOSEN / "model.joblib")
-    sample = pd.read_parquet(service_dir / "test_features.parquet").head(1000)
-    started = time.perf_counter()
-    model.predict(sample)
-    elapsed = time.perf_counter() - started
-    model_path = DATA_DIR / "reports" / "service" / CHOSEN / "model.joblib"
-    print("latency_ms_per_flow", elapsed / len(sample) * 1000)
-    print("throughput_flows_per_s", len(sample) / elapsed if elapsed else None)
-    print("model_bytes", model_path.stat().st_size)
-    rss = Path("/proc/self/status").read_text(encoding="utf-8")
-    print(next(line for line in rss.splitlines() if line.startswith("VmRSS")))
-    print(Path("/proc/cpuinfo").read_text(encoding="utf-8").split("model name")[1].split("\n", 1)[0])
-    print("boosting_device cpu")
-    
-    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "shap", "matplotlib"], check=True)
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    import shap
-    
-    background = pd.read_parquet(service_dir / "train_features.parquet").sample(n=min(200, len(pd.read_parquet(service_dir / "train_features.parquet"))), random_state=42)
-    explain = pd.read_parquet(service_dir / "validation_features.parquet").sample(n=min(200, len(pd.read_parquet(service_dir / "validation_features.parquet"))), random_state=42)
-    explainer = shap.TreeExplainer(model.estimator.estimator)
-    values = explainer.shap_values(explain)
-    shap_dir = DATA_DIR / "reports" / "shap"
-    shap_dir.mkdir(parents=True, exist_ok=True)
-    shap.summary_plot(values, explain, show=False, max_display=15)
-    plt.tight_layout()
-    plt.savefig(shap_dir / "service_summary.png", dpi=120)
-    plt.close()
-    print("shap_plot", shap_dir / "service_summary.png")
-    section_end("extra experiments", "idle, early packets, feature groups, cross-dataset, five seeds, latency, SHAP", [DATA_DIR / "reports"], "cross-dataset uses custom captures only; a missing sidecar stops the cell", "copy the summary")
+        for task_name in ("service", "application"):
+            marker = extra_dir / f"{task_name}_idle_{idle}.json"
+            if marker.exists() and not FORCE:
+                print("skip", marker)
+                continue
+            overlay = write_overlay(DRIVE_ROOT / f"overlay_{task_name}_{idle}_30.yaml", idle=idle, early=30)
+            config = load_config(root=PROJECT_DIR, task=task_name, overlay=overlay)
+            tables = []
+            for path in list(iscx):
+                if path.stat().st_size > MAX_PCAP_BYTES:
+                    print("skip_large", path.name)
+                    continue
+                tables.append(extract_iscx_pcap(path, config))
+            if sidecar.exists() and custom and sessions is not None:
+                label_spec = load_custom_spec(config.labels.custom)
+                named = set(sessions["file"].astype(str))
+                for path in list(custom):
+                    if path.stat().st_size > MAX_PCAP_BYTES or path.name not in named:
+                        continue
+                    tables.append(extract_custom_pcap(path, config, sessions, label_spec))
+            if not tables:
+                print("idle", idle, task_name, "no captures")
+                continue
+            raw_features = pd.concat([pd.concat([table.features, table.sequence], axis=1) for table in tables], ignore_index=True)
+            raw_meta = pd.concat([table.meta for table in tables], ignore_index=True)
+            raw_meta["label"] = raw_meta[task_name]
+            idle_scores = []
+            for source_name in ("iscx", "vlc"):
+                model_name = "random_forest"
+                for item in summaries:
+                    if item.get("task") == task_name:
+                        model_name = item.get("best_model", {}).get(source_name, model_name)
+                scored = score_source_cap(
+                    raw_features,
+                    raw_meta,
+                    config.features.flow,
+                    task=task_name,
+                    source_name=source_name,
+                    experiment=f"{source_name}_only_ablation_idle_{idle}",
+                    model_name=model_name,
+                    seed=config.seed,
+                    n_jobs=config.runtime.n_jobs,
+                    max_flows_per_capture=MAX_FLOWS_PER_CAPTURE,
+                    out=extra_dir,
+                    sessions=sessions,
+                )
+                value = validation_line(scored)
+                print("experiment", scored.get("experiment"), "model", model_name, "headline", False, "validation_macro_f1", value)
+                idle_scores.append({"experiment": scored.get("experiment"), "model": model_name, "validation_macro_f1": value, "headline": False})
+            record = {"task": task_name, "idle_timeout_s": idle, "early_packets": 30, "scores": idle_scores, "headline": False, "tuned": False}
+            marker.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+    (extra_dir / "sensitivity_summary.json").write_text(json.dumps(summaries, indent=2, default=str) + "\n", encoding="utf-8")
+    section_end(
+        "extra experiments",
+        "ISCX-only, VLC-only, cross-source, adversarial check, feature groups, early packets, idle timeout, five seeds, latency, SHAP",
+        [extra_dir],
+        "a class marked environment-confounded exists in only one capture source; mixed-source scores are not headlines",
+        "copy the labeled lines into the thesis",
+    )
 ''',
 )
 
