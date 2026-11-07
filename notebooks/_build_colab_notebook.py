@@ -1001,11 +1001,60 @@ add(
     r'''
 import json
 
+import numpy as np
 import pandas as pd
 
 from traffic_clf.config import load_config
 from traffic_clf.data.loaders import load_custom_sidecar
 from traffic_clf.evaluation.protocol import run_capture_protocol, run_security_protocol
+from traffic_clf.preprocess.prepare import load_preprocess_state
+
+def recover_unscaled(data_dir):
+    feature_path = data_dir / "unscaled_features.parquet"
+    meta_path = data_dir / "unscaled_meta.parquet"
+    if feature_path.exists() and meta_path.exists():
+        return pd.read_parquet(feature_path), pd.read_parquet(meta_path)
+    state_path = data_dir / "preprocess.joblib"
+    pieces = []
+    metas = []
+    for name in ("train", "validation", "test", "fp_check"):
+        features_file = data_dir / f"{name}_features.parquet"
+        meta_file = data_dir / f"{name}_meta.parquet"
+        if features_file.exists() and meta_file.exists():
+            pieces.append(pd.read_parquet(features_file))
+            metas.append(pd.read_parquet(meta_file))
+    if not state_path.exists() or not pieces:
+        raise RuntimeError(f"{data_dir} has neither unscaled tables nor a saved split that can be inverted.")
+    state = load_preprocess_state(state_path)
+    scaled = pd.concat(pieces, ignore_index=True)
+    meta = pd.concat(metas, ignore_index=True)
+    missing = [column for column in state.numeric_columns if column not in scaled.columns]
+    protocol_columns = ["protocol_other", "protocol_tcp", "protocol_udp"]
+    missing.extend(column for column in list(state.passthrough_columns) + protocol_columns if column not in scaled.columns)
+    if missing:
+        raise RuntimeError(f"{data_dir} is missing columns needed to invert the scaler: {', '.join(missing)}")
+    numeric = state.scaler.inverse_transform(scaled.loc[:, list(state.numeric_columns)].to_numpy())
+    recovered = pd.DataFrame(numeric, columns=list(state.numeric_columns))
+    if state.passthrough_columns:
+        recovered = pd.concat(
+            [recovered, scaled.loc[:, list(state.passthrough_columns)].reset_index(drop=True)],
+            axis=1,
+        )
+    codes = scaled.loc[:, protocol_columns].to_numpy()
+    protocol = np.array([np.nan, 6.0, 17.0], dtype=float)[codes.argmax(axis=1)]
+    protocol[codes.sum(axis=1) == 0] = np.nan
+    recovered["protocol"] = protocol
+    recovered.to_parquet(feature_path, index=False)
+    meta.to_parquet(meta_path, index=False)
+    print(
+        "recovered",
+        data_dir.name,
+        "rows",
+        len(recovered),
+        "by inverting preprocess.joblib. Originally missing values stay at the median of the old training split.",
+    )
+    return recovered, meta
+
 
 protocol_dir = DATA_DIR / "reports" / "protocol"
 ran = []
@@ -1014,19 +1063,16 @@ if sidecar.exists():
     sessions = load_custom_sidecar(sidecar, root=PROJECT_DIR)
 for task_name in ("service", "application"):
     data_dir = DATA_DIR / "processed" / task_name
-    feature_path = data_dir / "unscaled_features.parquet"
-    meta_path = data_dir / "unscaled_meta.parquet"
-    if not feature_path.exists() or not meta_path.exists():
-        raise RuntimeError(f"{data_dir} has no unscaled tables. Set FORCE = True and rerun preparation so the protocol can rebuild the split.")
     marker = protocol_dir / f"{task_name}_protocol.json"
     if marker.exists() and not FORCE:
         print("skip", marker)
         ran.append(task_name)
         continue
     config = load_config(root=PROJECT_DIR, task=task_name, overlay=OVERLAY)
+    features, meta = recover_unscaled(data_dir)
     run_capture_protocol(
-        pd.read_parquet(feature_path),
-        pd.read_parquet(meta_path),
+        features,
+        meta,
         config.features.flow,
         task=task_name,
         seed=config.seed,
@@ -1037,16 +1083,15 @@ for task_name in ("service", "application"):
     )
     ran.append(task_name)
 security_dir = DATA_DIR / "processed" / "security"
-security_features = security_dir / "unscaled_features.parquet"
-security_meta = security_dir / "unscaled_meta.parquet"
-if security_features.exists() and security_meta.exists():
+if (security_dir / "preprocess.joblib").exists() or (security_dir / "unscaled_features.parquet").exists():
     security_config = load_config(root=PROJECT_DIR, task="security", overlay=OVERLAY)
     stored = DATA_DIR / "reports" / "security" / "lightgbm" / "metrics.json"
     unseen = json.loads(stored.read_text(encoding="utf-8")) if stored.exists() else None
     if not (protocol_dir / "security_protocol.json").exists() or FORCE:
+        security_features, security_meta = recover_unscaled(security_dir)
         run_security_protocol(
-            pd.read_parquet(security_features),
-            pd.read_parquet(security_meta),
+            security_features,
+            security_meta,
             security_config.features.flow,
             split_manifest=PROJECT_DIR / "configs" / "splits" / "cic_ids2017.yaml",
             seed=security_config.seed,
