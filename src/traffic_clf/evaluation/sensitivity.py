@@ -388,9 +388,18 @@ def write_shap(
     validation = transformed.loc[labels["split"] == "validation"].head(sample_rows)
     if validation.empty:
         return {"experiment": f"{source_name}_only_shap", "status": "validation split is empty", "headline": False}
-    estimator = getattr(fitted, "estimator", fitted)
-    explainer = shap.TreeExplainer(estimator)
-    values = explainer.shap_values(validation)
+    try:
+        explainer = shap.TreeExplainer(_explain_model(fitted))
+        values = explainer.shap_values(validation)
+    except Exception as exc:
+        return {
+            "experiment": f"{source_name}_only_shap",
+            "task": task,
+            "model": model_name,
+            "status": f"shap failed: {exc}",
+            "headline": False,
+            "tuned": False,
+        }
     importance = _mean_abs_shap(values, list(validation.columns))
     directory = Path(out) / task / f"{source_name}_only_shap"
     directory.mkdir(parents=True, exist_ok=True)
@@ -408,6 +417,19 @@ def write_shap(
         "headline": False,
         "tuned": False,
     }
+
+
+def _explain_model(fitted: object) -> object:
+    """Return the fitted learner.
+
+    A random forest exposes ``estimator`` as the unfitted tree template.
+    Only the booster wrapper stores the fitted learner under that name.
+    """
+    from traffic_clf.training.run import _LabelIndexedModel
+
+    if isinstance(fitted, _LabelIndexedModel):
+        return fitted.estimator
+    return fitted
 
 
 def _score_variant(

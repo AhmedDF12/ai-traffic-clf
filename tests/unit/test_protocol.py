@@ -14,7 +14,8 @@ from traffic_clf.evaluation.protocol import (
     run_capture_protocol,
     run_source_protocol,
 )
-from traffic_clf.evaluation.sensitivity import select_feature_group, truncate_early_packets
+from traffic_clf.evaluation.sensitivity import _explain_model, select_feature_group, truncate_early_packets
+from traffic_clf.training.run import _LabelIndexedModel
 
 
 def test_cap_limits_each_capture_and_keeps_small_files() -> None:
@@ -228,6 +229,16 @@ def test_adversarial_reports_when_no_class_has_two_sources(repo_root: Path, tmp_
     assert cross["status"].startswith("no class")
     assert adversarial["status"] == "none exists"
     assert all(row["environment_confounded"] for row in payload["class_source_control"])
+
+
+def test_shap_keeps_the_fitted_forest() -> None:
+    from sklearn.ensemble import RandomForestClassifier
+
+    forest = RandomForestClassifier(n_estimators=2, random_state=0)
+    forest.fit([[0.0], [1.0], [0.0], [1.0]], ["chat", "chat", "voip", "voip"])
+    assert _explain_model(forest) is forest
+    wrapped = _LabelIndexedModel(forest, ("chat", "voip"))
+    assert _explain_model(wrapped) is forest
 
 
 def test_feature_groups_and_early_packets_drop_the_other_columns() -> None:
