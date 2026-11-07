@@ -298,7 +298,7 @@ def _one_label_per_capture(meta: pd.DataFrame) -> list[Group]:
                 f"Capture {capture_id} contains labels {labels}. "
                 "Split the file so each capture has one application."
             )
-        groups.append(Group(str(capture_id), labels[0]))
+        groups.append(Group(str(capture_id), labels[0], weight=int(len(part))))
     return groups
 
 

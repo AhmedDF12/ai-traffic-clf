@@ -24,10 +24,16 @@ ALLOWED_SPLITS = ("train", "validation", "test", "fp_check")
 
 @dataclass(frozen=True)
 class Group:
-    """One capture file and the class used to stratify the file split."""
+    """One capture file and the class used to stratify the file split.
+
+    ``weight`` is the number of flows in the file. Equal weights keep the
+    original file-count split. Unequal weights place large files in the split
+    that still has room, so one capture cannot fill validation by itself.
+    """
 
     group_id: str
     stratum: str
+    weight: int = 1
 
 
 @dataclass(frozen=True)
@@ -129,17 +135,22 @@ def assign_grouped_split(
         raise SplitError("No capture groups were provided.")
 
     by_stratum: dict[str, list[str]] = defaultdict(list)
+    weights: dict[str, int] = {}
     seen: set[str] = set()
     for group in groups:
         if not group.group_id or not group.stratum:
             raise SplitError("Every group needs a group id and a stratum.")
+        if isinstance(group.weight, bool) or not isinstance(group.weight, int) or group.weight < 1:
+            raise SplitError(f"Capture {group.group_id!r} needs a positive flow weight.")
         if group.group_id in seen:
             raise SplitError(f"Duplicate capture group {group.group_id!r}.")
         seen.add(group.group_id)
         by_stratum[group.stratum].append(group.group_id)
+        weights[group.group_id] = group.weight
 
     rng = random.Random(seed)
     assignment: dict[str, str] = {}
+    balance_by_weight = any(weight != 1 for weight in weights.values())
     for stratum in sorted(by_stratum):
         ids = sorted(by_stratum[stratum])
         if len(ids) < 3:
@@ -149,6 +160,9 @@ def assign_grouped_split(
                 "so the class is present in every split. Collect another capture "
                 "or move this class to the qualitative set."
             )
+        if balance_by_weight:
+            assignment.update(_assign_by_weight([(group_id, weights[group_id]) for group_id in ids], ratios, rng))
+            continue
         rng.shuffle(ids)
         n_train, n_val, _n_test = _split_counts(len(ids), ratios)
         for group_id in ids[:n_train]:
@@ -157,6 +171,37 @@ def assign_grouped_split(
             assignment[group_id] = "validation"
         for group_id in ids[n_train + n_val :]:
             assignment[group_id] = "test"
+    return assignment
+
+
+def _assign_by_weight(
+    items: list[tuple[str, int]],
+    ratios: tuple[float, float, float],
+    rng: random.Random,
+) -> dict[str, str]:
+    """Give each split at least one file and keep flow mass near 60/20/20."""
+    ordered = list(items)
+    rng.shuffle(ordered)
+    ordered.sort(key=lambda item: item[1], reverse=True)
+    total = sum(weight for _, weight in ordered)
+    targets = [total * ratio for ratio in ratios]
+    names = ("train", "validation", "test")
+    loads = [0, 0, 0]
+    counts = [0, 0, 0]
+    assignment: dict[str, str] = {}
+    for index, (group_id, weight) in enumerate(ordered):
+        remaining = len(ordered) - index
+        empty = [slot for slot, count in enumerate(counts) if count == 0]
+        if empty and remaining <= len(empty):
+            choice = empty[0]
+        else:
+            candidates = [slot for slot in range(3) if counts[slot] > 0 or remaining > len(empty)]
+            choice = max(candidates, key=lambda slot: (targets[slot] - loads[slot], -counts[slot]))
+        assignment[group_id] = names[choice]
+        loads[choice] += weight
+        counts[choice] += 1
+    if min(counts) < 1:
+        raise SplitError("Weight balancing left a split empty.")
     return assignment
 
 

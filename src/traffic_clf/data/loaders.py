@@ -107,6 +107,12 @@ def load_cic_csv(
         feature_aliases.setdefault(_norm_header(name), name)
     present = {feature_aliases[norm] for norm in norms if norm in feature_aliases}
     missing = [name for name in spec.model_columns if name not in present]
+    # The published CIC-IDS2017 MachineLearningCSV has every flow statistic but
+    # no Protocol column. Leave it missing so it becomes protocol_other later.
+    # Do not invent 6 or 17 from the port number.
+    protocol_absent = dataset == "cic_ids2017" and missing == ["protocol"]
+    if protocol_absent:
+        missing = []
     if missing:
         raise SchemaError(
             f"{csv_path.name} is missing features: {', '.join(missing)}. "
@@ -125,6 +131,14 @@ def load_cic_csv(
     for norm, canonical in feature_aliases.items():
         if norm in frame.columns and canonical in spec.model_columns:
             renamed_features[canonical] = frame[norm]
+    if "protocol" not in renamed_features.columns:
+        if not protocol_absent:
+            raise SchemaError(f"{csv_path.name} is missing features: protocol.")
+        renamed_features["protocol"] = float("nan")
+        print(
+            f"protocol_absent {csv_path.name}: CIC-IDS2017 MachineLearningCSV has no Protocol column. "
+            "The value stays missing and is encoded as protocol_other. No protocol number was filled in."
+        )
     features = _coerce_features(renamed_features, spec)
     raw_labels = frame["label"].map(lambda value: "" if pd.isna(value) else str(value).strip())
     if (raw_labels == "").any():

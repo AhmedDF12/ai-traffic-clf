@@ -133,24 +133,29 @@ traffic-clf tune --task service --model lightgbm --trials 20 --data data\process
 
 ## Google Colab
 
-The full-run notebook is `notebooks/colab_full_run.ipynb`. It does not contain measured scores. A fresh Colab runtime starts empty, so the notebook clones the repository, installs it, and writes prepared tables and MLflow to Google Drive.
+The full-run notebook is `notebooks/colab_full_run.ipynb`. It does not contain measured scores. A fresh Colab runtime starts empty, so the notebook clones the repository, installs it, downloads the public captures, prepares the tables, fits a random forest, and scores the test split once. Prepared tables and MLflow stay on Google Drive.
 
-Open it from GitHub by substituting your account and repository:
+Open the notebook from GitHub:
 
 ```text
-https://colab.research.google.com/github/ACCOUNT/REPOSITORY/blob/main/notebooks/colab_full_run.ipynb
+https://colab.research.google.com/github/AhmedDF12/ai-traffic-clf/blob/master/notebooks/colab_full_run.ipynb
 ```
 
-Or upload the file to Drive and choose Open with Google Colab.
+The repository is private, so add `GITHUB_TOKEN` in Colab Secrets before the clone cell. `GITHUB_REPO_URL` is already set to `https://github.com/AhmedDF12/ai-traffic-clf.git`.
 
-In the first code cell, set `GITHUB_REPO_URL` to `https://github.com/ACCOUNT/REPOSITORY.git`. In Colab, open the key icon and add secrets only if you need them:
+| Switch | Default | What it does |
+| --- | --- | --- |
+| `DOWNLOAD_VLC` | true | Downloads the Valencia VLC captures from Zenodo 15121418 onto Drive. YouTube, Netflix, and Spotify are streaming; `web_` files are browsing; Roblox is gaming. |
+| `MAX_PCAP_BYTES` | 500 MiB | Skips larger captures. The reader loads a whole file into memory. |
+| `DATA_SOURCE` | `drive` | Uses files already on Drive. Set `kaggle` only when Drive has about 27 GB free. |
+| `RUN_SEARCH` | false | The 50-trial booster search stays off. The random forest scores the test split once. |
 
 | Secret | When |
 | --- | --- |
-| `GITHUB_TOKEN` | The repository is private. A public repository does not need it. |
-| `KAGGLE_USERNAME` and `KAGGLE_KEY` | Required. `DATA_SOURCE` is `kaggle`, which downloads the ISCX captures and the CIC CSV files onto Drive. |
+| `GITHUB_TOKEN` | Required. The repository is private. |
+| `KAGGLE_USERNAME` and `KAGGLE_KEY` | Only when `DATA_SOURCE` is `kaggle`. That path downloads the ISCX captures and the CIC-IDS2017 CSV files. |
 
-The official CIC file URLs redirect to an HTML index, so the notebook downloads the public Kaggle copies onto Drive instead of submitting the registration form. The CIC download is the MachineLearningCSV files. The PCAP days are not downloaded.
+The official CIC file URLs redirect to an HTML index. Security runs only when those CSVs are already on Drive or the Kaggle download ran. File transfer stays absent until FTPS, SFTP, or Skype file captures are added. Prime Video and Teams are not downloaded, because those names are not in the application map. A prepared directory is rebuilt when the capture list changes, so an older service table is not reused after the VLC files arrive.
 
 `configs/colab.yaml` points at `/content` and selects CUDA. The notebook writes `MyDrive/ai-traffic-clf/drive_overlay.yaml` instead, keeps boosting on CPU, and stores outputs under `/content/drive/MyDrive/ai-traffic-clf`. The Linux commands, after that overlay exists, are:
 
@@ -160,7 +165,7 @@ traffic-clf prepare-cic --root /content/ai-traffic-clf --overlay /content/drive/
 traffic-clf tune --root /content/ai-traffic-clf --task service --model lightgbm --trials 50 --overlay /content/drive/MyDrive/ai-traffic-clf/drive_overlay.yaml --data /content/drive/MyDrive/ai-traffic-clf/data/processed/service --out /content/drive/MyDrive/ai-traffic-clf/data/reports/service/lightgbm
 ```
 
-Set `RUN_EXTRA = True` only after the main models exist. Idle-timeout ablation reads the captures again for 5, 15, 30, and 60 seconds. `RUN_NEURAL = True` stops, because the sequence networks are not in this repository. Finished output directories are skipped when `FORCE` is false.
+Set `RUN_SEARCH = True` only for a new 50-trial search, and only before the test split has been scored. Set `RUN_EXTRA = True` only after the main model exists. Idle-timeout ablation reads the captures again for 5, 15, 30, and 60 seconds. `RUN_NEURAL = True` stops, because the sequence networks are not in this repository. Finished output directories are skipped when `FORCE` is false and the capture list is unchanged.
 
 ## Not in this milestone
 

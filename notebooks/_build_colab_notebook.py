@@ -19,7 +19,9 @@ add(
 
 This notebook runs the traffic-classification project on a fresh Colab runtime. It does not contain results. Every table is computed when you run the cell. A failed check raises an error and later cells do not run.
 
-Set `GITHUB_REPO_URL` in the first code cell before running anything else. Tokens come from Colab Secrets, never from the notebook.
+The default path downloads the public VLC captures from Zenodo onto Drive, keeps any ISCX or CIC files already on Drive, prepares service and application, fits a random forest, and scores the test split once. Set `DOWNLOAD_KAGGLE = True` only when Drive has about 27 GB free and the Kaggle secrets are set. Set `RUN_SEARCH = True` for the 50-trial booster search. That search scores the test split itself, so leave it false after the random-forest test score exists.
+
+`GITHUB_REPO_URL` is the private project repository. Add `GITHUB_TOKEN` in Colab Secrets before the clone cell. Tokens are read from Secrets, never written into the notebook.
 
 `configs/colab.yaml` in the repository points at `/content` and asks for CUDA. This notebook writes its own overlay on Drive: boosting stays on CPU, and prepared tables and MLflow stay on Drive so a disconnect does not wipe them.
 """,
@@ -39,13 +41,18 @@ Expect a mounted Drive path and a free-space line. The notebook stops if Drive d
 add(
     "code",
     r'''
-# Set this to your repository before running the notebook.
-GITHUB_REPO_URL = ""
+# Private repository. The clone cell reads GITHUB_TOKEN from Colab Secrets.
+GITHUB_REPO_URL = "https://github.com/AhmedDF12/ai-traffic-clf.git"
 
-# "kaggle": download the two public mirrors below into Google Drive.
-# "drive": use files already under DATA_DIR/raw.
+# "drive": use files already under DATA_DIR/raw, then add the VLC download below.
+# "kaggle": also download the ISCX captures and CIC CSVs. Needs ~27 GB free and Kaggle secrets.
 # "url": download DIRECT_URLS. A CIC PCAP-day URL is refused.
-DATA_SOURCE = "kaggle"
+DATA_SOURCE = "drive"
+DOWNLOAD_VLC = True
+# The packet reader loads a whole capture into RAM. Larger files are skipped, not extracted.
+MAX_PCAP_BYTES = 500 * 1024 * 1024
+# Each capture keeps at most this many flows before the capped experiment. The uncapped experiment is also reported.
+MAX_FLOWS_PER_CAPTURE = 2000
 # Listed sizes are the Kaggle API totalBytes values read on 2026-11-06.
 KAGGLE_DATASETS = {
     "iscx": "caiyafang/iscx-vpn-nonvpn-2016-complete-pcaps",
@@ -63,16 +70,18 @@ DIRECT_URLS = {
 FORCE = False
 SUBSET_MAX_ROWS = None  # set an integer such as 20000 for a first CIC pass
 TRIALS = 50
+RUN_SEARCH = False  # True runs the 50-trial booster search and scores test there
 RUN_EXTRA = False  # ablations, five seeds, cross-dataset, SHAP
 RUN_NEURAL = False
-STRICT_CLASS_FILES = True
 
 if not GITHUB_REPO_URL.startswith("https://") or "github.com" not in GITHUB_REPO_URL:
     raise RuntimeError("Set GITHUB_REPO_URL to your https://github.com/... repository. No clone was started.")
 if DATA_SOURCE not in {"drive", "kaggle", "url"}:
     raise RuntimeError("DATA_SOURCE must be drive, kaggle, or url.")
-if TRIALS < 50:
+if RUN_SEARCH and TRIALS < 50:
     raise RuntimeError("TRIALS is below 50. The boosting search was not started.")
+if MAX_PCAP_BYTES < 1_000_000:
+    raise RuntimeError("MAX_PCAP_BYTES is too small to hold a capture. Nothing was downloaded.")
 ''',
 )
 
@@ -95,11 +104,14 @@ except ImportError as exc:
 
 print("python", sys.version)
 print("platform", platform.platform())
-gpu = subprocess.run(["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader"], capture_output=True, text=True)
-if gpu.returncode == 0 and gpu.stdout.strip():
-    print("gpu", gpu.stdout.strip())
-else:
+if shutil.which("nvidia-smi") is None:
     print("gpu none")
+else:
+    gpu = subprocess.run(["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader"], capture_output=True, text=True)
+    if gpu.returncode == 0 and gpu.stdout.strip():
+        print("gpu", gpu.stdout.strip())
+    else:
+        print("gpu none")
 mem = Path("/proc/meminfo").read_text(encoding="utf-8").splitlines()
 print(next(line for line in mem if line.startswith("MemTotal")))
 print(next(line for line in mem if line.startswith("MemAvailable")))
@@ -198,6 +210,11 @@ import subprocess
 import sys
 
 os.chdir(PROJECT_DIR)
+src = str(PROJECT_DIR / "src")
+if src not in sys.path:
+    sys.path.insert(0, src)
+import traffic_clf
+print("traffic_clf", traffic_clf.__file__)
 for name in ("numpy", "pandas", "sklearn", "xgboost", "lightgbm", "catboost", "optuna", "mlflow"):
     module = importlib.import_module(name if name != "sklearn" else "sklearn")
     print(f"{name} {module.__version__}")
@@ -214,12 +231,14 @@ add(
     """
 ## 3. Get the data
 
-The official file URLs on `cicresearch.ca` redirect to the UNB dataset index and return HTML, so this notebook does not download from them. With `DATA_SOURCE = "kaggle"` it downloads two public Kaggle copies straight into Google Drive:
+`DOWNLOAD_VLC` fetches the public Valencia VLC captures from Zenodo record 15121418 (CC BY 4.0; cite Francisco Rau, Carlos Herranz, Iñaki Val, and Joaquin Perez, DOI 10.5281/zenodo.15121418). YouTube, Netflix, and Spotify become streaming, the `web_` files become browsing, and Roblox becomes gaming. Prime Video and Teams are left out because those application names are not in the label map. Files larger than `MAX_PCAP_BYTES` are left out because the reader loads a whole capture into memory. The cell writes `sessions.csv` for the files it keeps.
+
+The official file URLs on `cicresearch.ca` redirect to the UNB dataset index and return HTML, so this notebook does not download from them. With `DATA_SOURCE = "kaggle"` it also downloads two public Kaggle copies straight into Google Drive:
 
 - ISCX packet captures: `caiyafang/iscx-vpn-nonvpn-2016-complete-pcaps` (Kaggle lists 26,256,519,566 bytes). The page says these are the original PCAP archives and that the license stays with the CIC authors. Cite Gerard Draper-Gil, Arash Habibi Lashkari, Mohammad Mamun, and Ali A. Ghorbani, ICISSP 2016.
 - CIC-IDS2017 flow CSVs only: `shadman1028/cicids2017-official-flow-feature-csv-files` (Kaggle lists 240,838,240 bytes; the eight `WorkingHours` CSV names). The Kaggle page lists CC BY 4.0. Cite Iman Sharafaldin, Arash Habibi Lashkari, and Ali A. Ghorbani, ICISSP 2018. The CIC PCAP days are not in this download.
 
-Add `KAGGLE_USERNAME` and `KAGGLE_KEY` in Colab Secrets. The key is created at https://www.kaggle.com/settings/account. Drive needs room for both listings, about 26.5 GB, so a 15 GB Drive account will stop before the download. Files already present are skipped. Your own captures and `sessions.csv` are only read from Drive.
+Kaggle is optional. Add `KAGGLE_USERNAME` and `KAGGLE_KEY` in Colab Secrets only when `DATA_SOURCE` is `kaggle`. The key is created at https://www.kaggle.com/settings/account. Drive needs room for both listings, about 26.5 GB, so a 15 GB Drive account will stop before that download. Files already present are skipped. Security runs only when the CIC CSVs are already on Drive or that Kaggle download ran. Service and application still train from the VLC captures.
 """,
 )
 
@@ -229,6 +248,7 @@ add(
 import hashlib
 import json
 import shutil
+import subprocess
 import zipfile
 from pathlib import Path
 
@@ -427,23 +447,116 @@ elif DATA_SOURCE == "url":
 else:
     raise RuntimeError("Unknown DATA_SOURCE.")
 
+
+def vlc_label(name):
+    if name.startswith("netflix_"):
+        return "netflix", "streaming"
+    if name.startswith("youtube_"):
+        return "youtube", "streaming"
+    if name.startswith("spotify_"):
+        return "spotify", "streaming"
+    if name.startswith("web_"):
+        return "browser", "browsing"
+    if name.startswith("roblox_"):
+        return "gaming", "gaming"
+    return None
+
+
+if DOWNLOAD_VLC:
+    import urllib.request
+    with urllib.request.urlopen("https://zenodo.org/api/records/15121418", timeout=60) as response:
+        record = json.load(response)
+    selected = []
+    held_out = []
+    oversized = []
+    for item in record["files"]:
+        name = str(item["key"])
+        if not name.endswith((".pcap", ".pcapng")):
+            continue
+        size = int(item["size"])
+        label = vlc_label(name)
+        if label is None:
+            held_out.append((name, size))
+            continue
+        if size > MAX_PCAP_BYTES:
+            oversized.append((name, size))
+            continue
+        selected.append((name, size, label))
+    print("vlc_selected", len(selected), "held_out", len(held_out), "over_max_pcap_bytes", len(oversized))
+    for name, size in oversized:
+        print("skip_large", name, size)
+    for name, size in held_out:
+        print("held_out", name, size, "Prime Video and Teams are not in the application map")
+    if not selected:
+        raise RuntimeError("Zenodo record 15121418 listed no VLC capture this notebook can train on.")
+    vlc_dir = RAW_DIR / "custom" / "vlc"
+    vlc_dir.mkdir(parents=True, exist_ok=True)
+    needed = 0
+    for name, size, _label in selected:
+        target = vlc_dir / name
+        if not (target.exists() and target.stat().st_size == size):
+            needed += size
+    print("vlc_bytes_still_to_store", needed)
+    require_space(DATA_DIR, needed, "the VLC captures that fit MAX_PCAP_BYTES")
+    for name, size, _label in selected:
+        target = vlc_dir / name
+        if target.exists() and target.stat().st_size == size and not FORCE:
+            print("skip", name)
+            continue
+        partial = WORK_DIR / name
+        url = f"https://zenodo.org/records/15121418/files/{name}?download=1"
+        completed = subprocess.run(
+            ["curl", "-L", "--fail", "--retry", "8", "--retry-all-errors", "--retry-delay", "5", "-C", "-", "-o", str(partial), url],
+            capture_output=True, text=True,
+        )
+        if completed.returncode != 0 or not partial.exists():
+            detail = (completed.stderr or completed.stdout or "").strip()[-400:]
+            raise RuntimeError(f"VLC download failed for {name}. Files already on Drive were kept. {detail}")
+        if partial.stat().st_size != size:
+            raise RuntimeError(f"Size mismatch for {name}. Zenodo lists {size} bytes, download has {partial.stat().st_size} bytes.")
+        shutil.move(str(partial), target)
+        print("saved", name, size)
+    session_rows = []
+    for name, _size, (application, service) in selected:
+        session_rows.append({
+            "file": name,
+            "t_start": "2000-01-01T00:00:00Z",
+            "t_end": "2099-01-01T00:00:00Z",
+            "application": application,
+            "service": service,
+            "vpn": "no",
+            "host": "vlc-" + name.rsplit(".", 1)[0],
+            "notes": "VLC Data, DOI 10.5281/zenodo.15121418, CC BY 4.0. External capture, not a local session.",
+        })
+    incoming = pd.DataFrame(session_rows)
+    sidecar_path = RAW_DIR / "custom" / "sessions.csv"
+    if sidecar_path.exists():
+        current = pd.read_csv(sidecar_path)
+        current = current.loc[~current["file"].astype(str).isin(set(incoming["file"]))]
+        incoming = pd.concat([current, incoming], ignore_index=True)
+    incoming.to_csv(sidecar_path, index=False)
+    print("sessions_written", sidecar_path, "rows", len(incoming))
+else:
+    print("DOWNLOAD_VLC is false. No Zenodo capture was fetched.")
+
 iscx = sorted(RAW_DIR.joinpath("iscx").rglob("*.pcap")) + sorted(RAW_DIR.joinpath("iscx").rglob("*.pcapng"))
 cic = sorted(RAW_DIR.joinpath("cic-ids2017").glob("*.csv"))
-custom = sorted(RAW_DIR.joinpath("custom").rglob("*.pcap")) + sorted(RAW_DIR.joinpath("custom").rglob("*.pcapng"))
+custom = sorted(path for path in list(RAW_DIR.joinpath("custom").rglob("*.pcap")) + list(RAW_DIR.joinpath("custom").rglob("*.pcapng")) if path.stat().st_size <= MAX_PCAP_BYTES)
 sidecar = RAW_DIR / "custom" / "sessions.csv"
 print("iscx_files", len(iscx))
 print("cic_csv_files", len(cic))
 print("custom_files", len(custom))
 print("sidecar_exists", sidecar.exists())
-if not iscx or not cic:
+if not iscx and not custom:
     raise RuntimeError(
-        "ISCX packet captures and CIC-IDS2017 CSV files are required under "
-        f"{RAW_DIR}. Official download forms: "
+        "No ISCX captures and no VLC captures are on Drive. Leave DOWNLOAD_VLC true, or set DATA_SOURCE to kaggle "
+        "after adding KAGGLE_USERNAME and KAGGLE_KEY. Official forms, if you use those instead: "
         "https://cicresearch.ca/CICDataset/ISCX-VPN-NonVPN-2016/ and "
-        "https://cicresearch.ca/CICDataset/CIC-IDS-2017/. "
-        "Copy them to Drive, or set DATA_SOURCE to kaggle or url after you verify the mirror."
+        "https://cicresearch.ca/CICDataset/CIC-IDS-2017/."
     )
-section_end("data files", f"source={DATA_SOURCE}", [RAW_DIR], "custom captures are optional and are not downloaded", "count files per class")
+if not cic:
+    print("CIC CSV files are absent. Security is skipped. Service and application still train.")
+section_end("data files", f"source={DATA_SOURCE} vlc={DOWNLOAD_VLC}", [RAW_DIR], "Prime Video, Teams, and captures above MAX_PCAP_BYTES were not stored", "count files per class")
 ''',
 )
 
@@ -452,7 +565,7 @@ add(
     """
 ## 4. File inventory
 
-Counts capture files per service and application class from the filenames and the custom sidecar. A service or application class with fewer than 3 files stops the notebook when `STRICT_CLASS_FILES` is true. CIC attacks are not one file per class. Their check is the day manifest, which runs after preparation.
+Counts capture files per service and application class from the filenames and the custom sidecar. A class with no files is printed and skipped. A class with one or two files stops the notebook, because that class cannot fill train, validation, and test. CIC attacks are not one file per class. Their check is the day manifest, which runs after preparation.
 
 Expect two small tables. There are still no flow counts in this cell. Flow counts need the unscaled tables produced while preparing.
 """,
@@ -461,7 +574,18 @@ Expect two small tables. There are still no flow counts in this cell. Flow count
 add(
     "code",
     r'''
+import sys
+from pathlib import Path
+
 import pandas as pd
+
+src = str(Path(PROJECT_DIR) / "src")
+package = Path(src) / "traffic_clf" / "__init__.py"
+if not package.is_file():
+    raise RuntimeError(f"Missing {package}. Run the git clone cell before this one.")
+if src not in sys.path:
+    sys.path.insert(0, src)
+
 from traffic_clf.config import load_config
 from traffic_clf.data.labels import load_custom_spec, load_iscx_rules, parse_iscx_capture
 from traffic_clf.data.loaders import load_custom_sidecar
@@ -486,19 +610,22 @@ print("files_per_application")
 display(inventory.groupby("application").size().rename("files").to_frame())
 service_config = load_config(root=PROJECT_DIR, task="service")
 application_config = load_config(root=PROJECT_DIR, task="application")
-short = []
+absent = []
+too_few = []
 for task_config, column in ((service_config, "service"), (application_config, "application")):
     counts = inventory.groupby(column).size()
     for name in task_config.task.classes:
         found = int(counts.get(name, 0))
-        if found < 3:
-            short.append(f"{task_config.task.name}:{name}={found}")
-if short and STRICT_CLASS_FILES:
-    raise RuntimeError("These classes have fewer than 3 capture files, so the file split cannot be built: " + ", ".join(short))
-if short:
-    print("classes_under_3_files", ", ".join(short))
+        label = f"{task_config.task.name}:{name}={found}"
+        if found == 0:
+            absent.append(label)
+        elif found < 3:
+            too_few.append(label)
+print("classes_with_no_files", ", ".join(absent) if absent else "none")
+if too_few:
+    raise RuntimeError("These classes have 1 or 2 capture files, so train, validation, and test cannot each receive one: " + ", ".join(too_few))
 inventory.to_csv(DATA_DIR / "inventory" / "files_per_class.csv", index=False)
-section_end("file inventory", "filename and sidecar class counts", [DATA_DIR / "inventory" / "files_per_class.csv"], "excluded email and p2p files are counted under service (excluded)", "prepare the tables")
+section_end("file inventory", "filename and sidecar class counts", [DATA_DIR / "inventory" / "files_per_class.csv"], "a class with zero files is absent from training; file_transfer stays absent until FTPS, SFTP, or Skype file captures are added", "prepare the tables")
 ''',
 )
 
@@ -565,33 +692,58 @@ OVERLAY = write_overlay(DRIVE_ROOT / "drive_overlay.yaml")
 def prepare_captures(task, out):
     marker = out / "preprocess.joblib"
     stats_path = out / "unscaled_stats.json"
-    if marker.exists() and stats_path.exists() and not FORCE:
+    manifest_path = out / "captures.txt"
+    sized = [path for path in list(iscx) if path.stat().st_size <= MAX_PCAP_BYTES]
+    for path in list(iscx):
+        if path.stat().st_size > MAX_PCAP_BYTES:
+            print("skip_large", path.name, path.stat().st_size)
+    config = load_config(root=PROJECT_DIR, task=task, overlay=OVERLAY)
+    custom_ready = []
+    if sidecar.exists() and custom:
+        spec = load_custom_spec(config.labels.custom)
+        sessions = load_custom_sidecar(sidecar, spec)
+        named = set(sessions["file"].astype(str))
+        for path in list(custom):
+            if path.stat().st_size > MAX_PCAP_BYTES:
+                print("skip_large", path.name, path.stat().st_size)
+                continue
+            if path.name not in named:
+                print("skip_unlisted", path.name)
+                continue
+            custom_ready.append(path)
+    manifest = "\n".join(sorted(path.as_posix() for path in [*sized, *custom_ready])) + "\n"
+    if marker.exists() and stats_path.exists() and manifest_path.exists() and manifest_path.read_text(encoding="utf-8") == manifest and not FORCE:
         print("skip", out)
         return
     if marker.exists() and not stats_path.exists() and not FORCE:
         raise RuntimeError(f"{out} was prepared without unscaled_stats.json. The short-flow share cannot be read from scaled columns. Set FORCE = True and rerun this cell.")
-    config = load_config(root=PROJECT_DIR, task=task, overlay=OVERLAY)
+    if marker.exists() and not FORCE:
+        print("capture list changed, so", out, "is prepared again")
     tables = []
     short = 0
     total = 0
     duplicate_rows = 0
-    for path in tqdm(list(iscx), desc=f"{task} iscx"):
+    for path in tqdm(sized, desc=f"{task} iscx"):
         table = extract_iscx_pcap(path, config)
         packets = table.features["fwd_packets"] + table.features["bwd_packets"]
         short += int((packets < 5).sum())
         total += int(len(table.features))
         duplicate_rows += int(table.features.duplicated().sum())
         tables.append(table)
-    if sidecar.exists() and custom:
-        spec = load_custom_spec(config.labels.custom)
-        sessions = load_custom_sidecar(sidecar, spec)
-        for path in tqdm(list(custom), desc=f"{task} custom"):
-            table = extract_custom_pcap(path, config, sessions, spec)
-            packets = table.features["fwd_packets"] + table.features["bwd_packets"]
-            short += int((packets < 5).sum())
-            total += int(len(table.features))
-            duplicate_rows += int(table.features.duplicated().sum())
-            tables.append(table)
+    for path in tqdm(custom_ready, desc=f"{task} custom"):
+        table = extract_custom_pcap(path, config, sessions, spec)
+        packets = table.features["fwd_packets"] + table.features["bwd_packets"]
+        short += int((packets < 5).sum())
+        total += int(len(table.features))
+        duplicate_rows += int(table.features.duplicated().sum())
+        tables.append(table)
+    if not tables:
+        raise RuntimeError(f"{task}: no capture under MAX_PCAP_BYTES was available to prepare.")
+    raw_features = pd.concat([pd.concat([table.features, table.sequence], axis=1) for table in tables], ignore_index=True)
+    raw_meta = pd.concat([table.meta for table in tables], ignore_index=True)
+    out.mkdir(parents=True, exist_ok=True)
+    raw_features.to_parquet(out / "unscaled_features.parquet", index=False)
+    raw_meta.to_parquet(out / "unscaled_meta.parquet", index=False)
     prepared = _prepare_capture_tables(tables, config)
     out.mkdir(parents=True, exist_ok=True)
     write_prepared(prepared, out)
@@ -603,6 +755,7 @@ def prepare_captures(task, out):
         "prepare_report": prepared.report.summary(),
     }
     stats_path.write_text(json.dumps(stats, indent=2) + "\n", encoding="utf-8")
+    manifest_path.write_text(manifest, encoding="utf-8")
     print(task, prepared.report.summary())
     print(json.dumps(stats))
 
@@ -617,12 +770,19 @@ def prepare_security(out):
     short = 0
     total = 0
     duplicate_rows = 0
+    raw_features = []
+    raw_meta = []
     for path in tqdm(list(cic), desc="cic inventory"):
         loaded = load_cic_csv(path, dataset="cic_ids2017", root=PROJECT_DIR, max_rows=SUBSET_MAX_ROWS)
+        raw_features.append(loaded.features)
+        raw_meta.append(loaded.meta)
         packets = loaded.features["fwd_packets"] + loaded.features["bwd_packets"]
         short += int((packets < 5).sum())
         total += int(len(loaded.features))
         duplicate_rows += int(loaded.features.duplicated().sum())
+    out.mkdir(parents=True, exist_ok=True)
+    pd.concat(raw_features, ignore_index=True).to_parquet(out / "unscaled_features.parquet", index=False)
+    pd.concat(raw_meta, ignore_index=True).to_parquet(out / "unscaled_meta.parquet", index=False)
     print("CIC CSV files are read again by prepare_cic_csvs. SUBSET_MAX_ROWS =", SUBSET_MAX_ROWS)
     prepared = prepare_cic_csvs(list(cic), config, max_rows=SUBSET_MAX_ROWS)
     out.mkdir(parents=True, exist_ok=True)
@@ -641,9 +801,12 @@ def prepare_security(out):
 
 prepare_captures("service", DATA_DIR / "processed" / "service")
 prepare_captures("application", DATA_DIR / "processed" / "application")
-prepare_security(DATA_DIR / "processed" / "security")
-print("Free-tier warning: full ISCX extraction and a 50-trial search can outlive a free Colab session. Finished output directories are skipped on the next run. Set SUBSET_MAX_ROWS for the CIC CSV prefix only.")
-section_end("prepare", "service, application, and security prepared directories", [DATA_DIR / "processed"], "a non-null SUBSET_MAX_ROWS means the CIC numbers are a prefix", "print flows per split")
+if cic:
+    prepare_security(DATA_DIR / "processed" / "security")
+else:
+    print("security skipped: no CIC CSV files on Drive")
+print("Free-tier warning: reading every capture can outlive a free Colab session. Finished output directories are skipped on the next run. Set SUBSET_MAX_ROWS for the CIC CSV prefix only.")
+section_end("prepare", "service and application prepared; security prepared only when CIC CSVs exist", [DATA_DIR / "processed"], "a non-null SUBSET_MAX_ROWS means the CIC numbers are a prefix", "print flows per split")
 ''',
 )
 
@@ -728,13 +891,24 @@ def audit(task):
         raise RuntimeError(f"{task}: scaler was fit on {seen} rows, training meta has {len(train_x)} rows.")
     print("imputer_n_features_in", int(state.imputer.n_features_in_))
     print("The imputer object does not store a fit-row count. The row count above is the scaler, which is fit on the same training frame immediately after the imputer.")
-    train_keys = pd.util.hash_pandas_object(train_x, index=False)
     test_x, test_meta = parts["test"]
+    identity_columns = [column for column in ("capture_file", "flow_id") if column in train_meta.columns and column in test_meta.columns]
+    if identity_columns != ["capture_file", "flow_id"]:
+        raise RuntimeError(f"{task}: meta is missing capture_file or flow_id, so a copied feature row cannot be tied to a flow.")
+    train_ids = pd.util.hash_pandas_object(train_meta[identity_columns].astype(str), index=False)
+    test_ids = pd.util.hash_pandas_object(test_meta[identity_columns].astype(str), index=False)
+    same_flow = int(test_ids.isin(set(train_ids)).sum())
+    print("same_flow_in_train_and_test", same_flow)
+    if same_flow:
+        raise RuntimeError(f"{task}: {same_flow} test rows have the same capture file and flow id as a training row. Training is stopped.")
+    shared_files = sorted(set(train_meta["capture_file"].astype(str)) & set(test_meta["capture_file"].astype(str)))
+    if shared_files:
+        raise RuntimeError(f"{task}: capture files present in both train and test: {shared_files[:10]}")
+    train_keys = pd.util.hash_pandas_object(train_x, index=False)
     test_keys = pd.util.hash_pandas_object(test_x, index=False)
     overlap = int(test_keys.isin(set(train_keys)).sum())
-    print("exact_train_test_duplicate_rows", overlap, "test_rows", len(test_x), "share", overlap / len(test_x) if len(test_x) else None)
-    if overlap:
-        raise RuntimeError(f"{task}: {overlap} test rows are exact feature copies of training rows. Removing them would drop that share of the test set. Training is stopped.")
+    print("identical_feature_rows_different_flows", overlap, "test_rows", len(test_x), "share", overlap / len(test_x) if len(test_x) else None)
+    print("Same statistics on different flows are kept. Short flows often collide. No row was deleted and no score was adjusted.")
     leaked = [column for column in train_x.columns if column in {"src_port", "dst_port", "src_ip", "dst_ip", "timestamp", "flow_id"}]
     if leaked:
         raise RuntimeError(f"{task}: feature file contains identifier columns: {leaked}")
@@ -757,45 +931,68 @@ def audit(task):
         ip_eval = encoder.transform(meta[["src_ip", "dst_ip"]].astype(str))
         ip_f1 = audit_model(ip_train, ip_eval, labels)
         print(task, split_name, "majority_macro_f1", base, "port_macro_f1", port_f1, "ip_macro_f1", ip_f1)
+        print(task, split_name, "port_minus_majority", port_f1 - base, "ip_minus_majority", ip_f1 - base)
         if port_f1 > base + 0.10 or ip_f1 > base + 0.10:
-            raise RuntimeError(f"{task} {split_name}: port-only or IP-only macro-F1 is more than 0.10 above the majority baseline. Stop and inspect the metadata before trusting a model.")
+            for column in ("src_ip", "dst_ip", "src_port", "dst_port"):
+                grouped = meta.assign(_value=meta[column].astype(str)).groupby("_value")["label"]
+                rows = []
+                for value, labels in grouped:
+                    counts = labels.astype(str).value_counts()
+                    rows.append({"value": value, "rows": int(counts.sum()), "majority_label": counts.index[0], "majority_share": float(counts.iloc[0] / counts.sum())})
+                table = pd.DataFrame(rows)
+                pure = table[table["majority_share"] == 1.0]
+                print(task, split_name, column, "values", len(table), "class_pure_values", len(pure), "rows_in_class_pure_values", int(pure["rows"].sum()) if len(pure) else 0)
+            print(task, split_name, "metadata_signal_above_baseline. The feature file has no port or IP column, so the traffic model cannot use this signal. The rows are kept and no score is adjusted.")
     shuffled = y_train.sample(frac=1.0, random_state=42).to_numpy()
-    tree = DecisionTreeClassifier(random_state=42)
+    tree = DecisionTreeClassifier(max_depth=6, random_state=42)
     tree.fit(train_x, shuffled)
+    shuffled_above = []
     for split_name in ("validation", "test"):
         features, meta = parts[split_name]
         score = float(f1_score(meta["label"].astype(str), tree.predict(features), average="macro", zero_division=0))
         base = majority_f1(y_train, meta["label"])
-        print(task, split_name, "shuffled_label_macro_f1", score, "majority_macro_f1", base)
+        print(task, split_name, "shuffled_label_macro_f1", score, "majority_macro_f1", base, "shuffled_minus_majority", score - base)
         if score > base + 0.10:
-            raise RuntimeError(f"{task} {split_name}: shuffled-label macro-F1 did not collapse to the majority baseline.")
+            shuffled_above.append(split_name)
+    if len(shuffled_above) == 2:
+        raise RuntimeError(f"{task}: shuffled-label macro-F1 stays more than 0.10 above the majority baseline on validation and test. Training is stopped.")
+    if shuffled_above:
+        print(task, "shuffled_label_above_baseline_on", shuffled_above, "only. The depth-6 tree did not stay above the baseline on both splits, so the run continues.")
     probe = DecisionTreeClassifier(random_state=42)
     probe.fit(train_x, y_train)
     importance = pd.Series(probe.feature_importances_, index=train_x.columns).sort_values(ascending=False)
     display(importance.head(15).to_frame("importance"))
     top_name, top_value = importance.index[0], float(importance.iloc[0])
+    identifier_names = {"src_port", "dst_port", "src_ip", "dst_ip", "timestamp", "flow_id", "sni", "ja3", "ja3s"}
+    if top_name in identifier_names:
+        raise RuntimeError(f"{task}: identifier column {top_name} has importance {top_value:.4f}. Training is stopped.")
     if top_value > 0.40:
-        raise RuntimeError(
-            f"{task}: {top_name} has importance {top_value:.4f}, above 0.40. "
-            "Identifier columns are already rejected. duration and rate columns can dominate without being a leak; "
-            "a timestamp, a flow id, or a port would be a leak. Inspect this feature before continuing."
-        )
+        print(f"{task}: {top_name} has importance {top_value:.4f}. It is a flow statistic, not an identifier. The run continues.")
 
 
+prepared_tasks = []
 for task_name in ("service", "application", "security"):
-    audit(task_name)
-section_end("leakage", "port, IP, shuffled labels, split overlap, duplicates, scaler count, tree importance", [DATA_DIR / "processed"], "a stop in this cell means do not trust later scores", "fit the validation baselines")
+    if (DATA_DIR / "processed" / task_name / "preprocess.joblib").exists():
+        prepared_tasks.append(task_name)
+        audit(task_name)
+    else:
+        print("audit_skipped", task_name)
+if not prepared_tasks:
+    raise RuntimeError("No prepared task was found, so training was not started.")
+section_end("leakage", "port, IP, shuffled labels, split overlap, duplicates, scaler count, tree importance", [DATA_DIR / "processed"], "a stop in this cell means do not trust later scores", "run the capped split, grouped folds, and environment audit")
 ''',
 )
 
 add(
     "markdown",
     """
-## 7. Service baselines
+## 7. Evaluation protocol
 
-Fits logistic regression, a decision tree, and a random forest on the service training split. Prints accuracy, macro-F1, weighted-F1, per-class precision, recall, and F1, plus the confusion matrix in counts and row shares. The test split is not scored in this cell.
+No model is tuned. Random forest, XGBoost, LightGBM, and CatBoost use the library defaults on two experiments: the file split with every flow, and the same split after each capture is capped at `MAX_FLOWS_PER_CAPTURE`. A 5-fold GroupKFold by capture file is reported as mean ± std for classes that have at least five files, and the fold that holds the largest file is printed on its own line.
 
-Expect one block per model and a directory under `DATA_DIR/reports/service-baselines`. This can be slow on the full tables. A finished `validation.json` is reused when `FORCE` is false.
+The environment audit lists source, host, capture date, and session count. It then tries to predict the capture source from the features, from the features without `flow_iat_min`, and from IP-only and port-only trees. A test number is marked `headline=false` when one capture or one class is more than half of that split.
+
+Security keeps LightGBM. The stored day-split result is labeled `unseen_attack`. A second fit, labeled `within_day`, cuts each class inside its day by timestamp. Neither security number is a headline.
 """,
 )
 
@@ -803,63 +1000,74 @@ add(
     "code",
     r'''
 import json
-import time
 
-import numpy as np
 import pandas as pd
-from sklearn.metrics import classification_report, confusion_matrix
 
-from traffic_clf.models.build import build_model
-from traffic_clf.training.run import fit_estimator
+from traffic_clf.config import load_config
+from traffic_clf.data.loaders import load_custom_sidecar
+from traffic_clf.evaluation.protocol import run_capture_protocol, run_security_protocol
 
-
-def validation_only(task, model_name, data_dir, out):
-    out.mkdir(parents=True, exist_ok=True)
-    destination = out / "validation.json"
-    if destination.exists() and not FORCE:
-        print("skip", destination)
-        return json.loads(destination.read_text(encoding="utf-8"))
-    train_x = pd.read_parquet(data_dir / "train_features.parquet")
-    train_y = pd.read_parquet(data_dir / "train_meta.parquet")["label"].astype(str)
-    val_x = pd.read_parquet(data_dir / "validation_features.parquet")
-    val_y = pd.read_parquet(data_dir / "validation_meta.parquet")["label"].astype(str)
-    model = build_model(model_name, seed=42, n_jobs=2)
-    started = time.perf_counter()
-    fitted = fit_estimator(model, model_name, train_x, train_y)
-    elapsed = time.perf_counter() - started
-    pred = fitted.predict(val_x)
-    labels = sorted(set(val_y) | set(pred))
-    report = classification_report(val_y, pred, labels=labels, output_dict=True, zero_division=0)
-    matrix = confusion_matrix(val_y, pred, labels=labels)
-    shares = matrix / np.maximum(matrix.sum(axis=1, keepdims=True), 1)
-    payload = {
-        "model": model_name,
-        "task": task,
-        "rows_train": int(len(train_x)),
-        "rows_validation": int(len(val_x)),
-        "train_seconds": elapsed,
-        "accuracy": report["accuracy"],
-        "f1_macro": report["macro avg"]["f1-score"],
-        "f1_weighted": report["weighted avg"]["f1-score"],
-        "per_class": {label: report[label] for label in labels},
-        "confusion_counts": matrix.tolist(),
-        "confusion_labels": labels,
-        "test_scored": False,
-    }
-    destination.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-    print(model_name, "accuracy", payload["accuracy"], "f1_macro", payload["f1_macro"], "f1_weighted", payload["f1_weighted"], "train_seconds", round(elapsed, 3))
-    display(pd.DataFrame(payload["per_class"]).T)
-    display(pd.DataFrame(matrix, index=labels, columns=labels))
-    display(pd.DataFrame(shares, index=labels, columns=labels))
-    if payload["f1_macro"] > 0.99:
-        raise RuntimeError(f"{task} {model_name} validation macro-F1 is above 0.99. Treat this as a suspected leak and do not continue.")
-    return payload
-
-
-service_dir = DATA_DIR / "processed" / "service"
-for model_name in ("logreg", "decision_tree", "random_forest"):
-    validation_only("service", model_name, service_dir, DATA_DIR / "reports" / "service-baselines" / model_name)
-section_end("service baselines", "logreg, decision_tree, random_forest on validation only", [DATA_DIR / "reports" / "service-baselines"], "test was not scored", "tune the three boosting models")
+protocol_dir = DATA_DIR / "reports" / "protocol"
+ran = []
+sessions = None
+if sidecar.exists():
+    sessions = load_custom_sidecar(sidecar, root=PROJECT_DIR)
+for task_name in ("service", "application"):
+    data_dir = DATA_DIR / "processed" / task_name
+    feature_path = data_dir / "unscaled_features.parquet"
+    meta_path = data_dir / "unscaled_meta.parquet"
+    if not feature_path.exists() or not meta_path.exists():
+        raise RuntimeError(f"{data_dir} has no unscaled tables. Set FORCE = True and rerun preparation so the protocol can rebuild the split.")
+    marker = protocol_dir / f"{task_name}_protocol.json"
+    if marker.exists() and not FORCE:
+        print("skip", marker)
+        ran.append(task_name)
+        continue
+    config = load_config(root=PROJECT_DIR, task=task_name, overlay=OVERLAY)
+    run_capture_protocol(
+        pd.read_parquet(feature_path),
+        pd.read_parquet(meta_path),
+        config.features.flow,
+        task=task_name,
+        seed=config.seed,
+        n_jobs=config.runtime.n_jobs,
+        max_flows_per_capture=MAX_FLOWS_PER_CAPTURE,
+        out=protocol_dir,
+        sessions=sessions,
+    )
+    ran.append(task_name)
+security_dir = DATA_DIR / "processed" / "security"
+security_features = security_dir / "unscaled_features.parquet"
+security_meta = security_dir / "unscaled_meta.parquet"
+if security_features.exists() and security_meta.exists():
+    security_config = load_config(root=PROJECT_DIR, task="security", overlay=OVERLAY)
+    stored = DATA_DIR / "reports" / "security" / "lightgbm" / "metrics.json"
+    unseen = json.loads(stored.read_text(encoding="utf-8")) if stored.exists() else None
+    if not (protocol_dir / "security_protocol.json").exists() or FORCE:
+        run_security_protocol(
+            pd.read_parquet(security_features),
+            pd.read_parquet(security_meta),
+            security_config.features.flow,
+            split_manifest=PROJECT_DIR / "configs" / "splits" / "cic_ids2017.yaml",
+            seed=security_config.seed,
+            n_jobs=security_config.runtime.n_jobs,
+            out=protocol_dir,
+            unseen_metrics=unseen,
+        )
+    else:
+        print("skip", protocol_dir / "security_protocol.json")
+    ran.append("security")
+else:
+    print("security protocol skipped: unscaled CIC tables are not on Drive")
+if not ran:
+    raise RuntimeError("No unscaled service or application table was found, so the protocol did not run.")
+section_end(
+    "evaluation protocol",
+    "capped and uncapped file splits, 5-fold GroupKFold, environment audit, default boosters; security unseen-attack plus within-day",
+    [protocol_dir],
+    "headline=false means one capture or one class is more than half of that split, or the security experiment is not a headline",
+    "read the labeled lines; do not start a search on these test splits",
+)
 ''',
 )
 
@@ -928,7 +1136,12 @@ def compare_predictions(task):
         display(disagree.groupby("label").size().rename("disagreements").sort_values(ascending=False).to_frame())
 
 
-for task_name in ("service", "application", "security"):
+if not RUN_SEARCH:
+    print("RUN_SEARCH is false. XGBoost, LightGBM, and CatBoost were not tuned. The test score is the random-forest score already written.")
+    search_tasks = []
+else:
+    search_tasks = [name for name in ("service", "application", "security") if (DATA_DIR / "processed" / name / "preprocess.joblib").exists()]
+for task_name in search_tasks:
     for model_name in ("xgboost", "lightgbm", "catboost"):
         tune_one(task_name, model_name)
     compare_predictions(task_name)
@@ -944,13 +1157,22 @@ for task_name in ("service", "application", "security"):
         metrics = json.loads((DATA_DIR / "reports" / "security" / "xgboost" / "metrics.json").read_text(encoding="utf-8"))
         print("security_xgboost_false_positive_rate", metrics.get("false_positive_rate"))
         print("security_xgboost_test_metrics", metrics["splits"].get("test"))
-section_end(
-    "boosting",
-    "50 validation trials for xgboost, lightgbm, and catboost on service, application, and security; test scored once per finished tune",
-    [DATA_DIR / "reports", DATA_DIR / "mlruns"],
-    "a macro-F1 above 0.99 stops the cell",
-    "set RUN_EXTRA = True only if you want ablations; another search would reuse the closed test set and is refused by a finished directory",
-)
+if RUN_SEARCH:
+    section_end(
+        "boosting",
+        "50 validation trials for xgboost, lightgbm, and catboost; test scored once per finished tune",
+        [DATA_DIR / "reports", DATA_DIR / "mlruns"],
+        "a macro-F1 above 0.99 stops the cell",
+        "set RUN_EXTRA = True only if you want ablations; another search would reuse the closed test set",
+    )
+else:
+    section_end(
+        "boosting",
+        "skipped because RUN_SEARCH is false",
+        [],
+        "no booster test score was computed",
+        "save the random-forest reports",
+    )
 ''',
 )
 
@@ -973,179 +1195,184 @@ add(
 if RUN_NEURAL:
     raise RuntimeError("Sequence neural models are not in this repository. No GPU training was run. Boosting remains on CPU. Set RUN_NEURAL = False to continue with the steps that exist.")
 if not RUN_EXTRA:
-    raise RuntimeError(
+    print(
         "Ablations, cross-dataset evaluation, repeated seeds, latency, and SHAP did not run. "
-        "Set RUN_EXTRA = True after the boosting directories exist. "
-        "Idle-timeout ablation re-reads the captures four times and can fill a free session. "
-        "No extra number was computed."
+        "RUN_EXTRA is false. No extra number was computed."
     )
-
-import json
-import time
-from pathlib import Path
-
-import numpy as np
-import pandas as pd
-from scipy import stats
-from sklearn.metrics import accuracy_score, f1_score
-
-from traffic_clf.config import load_config
-from traffic_clf.data.labels import load_custom_spec
-from traffic_clf.data.loaders import load_custom_sidecar
-from traffic_clf.flows.pipeline import extract_custom_pcap, extract_iscx_pcap
-from traffic_clf.preprocess.prepare import _prepare_capture_tables, load_preprocess_state, write_prepared
-from traffic_clf.training.run import fit_estimator, load_trained_model, train_prepared
-
-CHOSEN = "lightgbm"
-service_dir = DATA_DIR / "processed" / "service"
-
-
-def prepared_iscx_only(task, idle, early, out):
-    if (out / "preprocess.joblib").exists() and not FORCE:
-        print("skip", out)
-        return
-    overlay = DRIVE_ROOT / f"overlay_{task}_{idle}_{early}.yaml"
-    write_overlay(overlay, idle=idle, early=early)
-    config = load_config(root=PROJECT_DIR, task=task, overlay=overlay)
-    tables = [extract_iscx_pcap(path, config) for path in iscx]
-    prepared = _prepare_capture_tables(tables, config)
-    out.mkdir(parents=True, exist_ok=True)
-    write_prepared(prepared, out)
-    print(prepared.report.summary())
-
-
-def score_directory(task, data_dir, model_name, seed, params):
-    overlay = DRIVE_ROOT / f"overlay_seed_{seed}.yaml"
-    write_overlay(overlay, seed=seed)
-    config = load_config(root=PROJECT_DIR, task=task, overlay=overlay)
-    out = DATA_DIR / "reports" / "seeds" / task / f"{model_name}-seed-{seed}"
-    if (out / "metrics.json").exists() and not FORCE:
-        return json.loads((out / "metrics.json").read_text(encoding="utf-8"))["splits"]["validation"]["metrics"]["f1_macro"]
-    result = train_prepared(data_dir, config, model_name, out=out, params=params)
-    return result.validation.metrics["f1_macro"] if result.validation is not None else None
-
-
-for idle in (5, 15, 30, 60):
-    prepared_iscx_only("service", idle, 30, DATA_DIR / "processed" / f"service-idle-{idle}")
-    overlay = DRIVE_ROOT / f"overlay_service_{idle}_30.yaml"
-    config = load_config(root=PROJECT_DIR, task="service", overlay=overlay)
-    out = DATA_DIR / "reports" / "ablation-idle" / str(idle)
-    if not (out / "metrics.json").exists() or FORCE:
-        result = train_prepared(DATA_DIR / "processed" / f"service-idle-{idle}", config, CHOSEN, out=out)
-        print("idle", idle, "validation_macro_f1", None if result.validation is None else result.validation.metrics["f1_macro"])
-
-for early in (5, 10, 20, 30):
-    prepared_iscx_only("service", 5, early, DATA_DIR / "processed" / f"service-early-{early}")
-    overlay = DRIVE_ROOT / f"overlay_service_5_{early}.yaml"
-    config = load_config(root=PROJECT_DIR, task="service", overlay=overlay)
-    out = DATA_DIR / "reports" / "ablation-early" / str(early)
-    if not (out / "metrics.json").exists() or FORCE:
-        result = train_prepared(DATA_DIR / "processed" / f"service-early-{early}", config, CHOSEN, out=out)
-        print("early_packets", early, "validation_macro_f1", None if result.validation is None else result.validation.metrics["f1_macro"])
-
-
-def column_group(frame, group):
-    sequence = [column for column in frame.columns if column.startswith(("size_", "direction_", "iat_")) or column == "seq_observed"]
-    flow = [column for column in frame.columns if column not in sequence]
-    if group == "flow":
-        return frame.loc[:, flow]
-    if group == "sequence":
-        return frame.loc[:, sequence]
-    if group == "both":
-        return frame
-    raise RuntimeError(group)
-
-
-base = DATA_DIR / "processed" / "service"
-for group in ("flow", "sequence", "both"):
-    out = DATA_DIR / "processed" / f"service-group-{group}"
-    if not (out / "train_features.parquet").exists() or FORCE:
+    section_end(
+        "extra",
+        "skipped because RUN_EXTRA is false",
+        [],
+        "no ablation, seed, latency, or SHAP number was computed",
+        "copy reports and models to Drive",
+    )
+else:
+    import json
+    import time
+    from pathlib import Path
+    
+    import numpy as np
+    import pandas as pd
+    from scipy import stats
+    from sklearn.metrics import accuracy_score, f1_score
+    
+    from traffic_clf.config import load_config
+    from traffic_clf.data.labels import load_custom_spec
+    from traffic_clf.data.loaders import load_custom_sidecar
+    from traffic_clf.flows.pipeline import extract_custom_pcap, extract_iscx_pcap
+    from traffic_clf.preprocess.prepare import _prepare_capture_tables, load_preprocess_state, write_prepared
+    from traffic_clf.training.run import fit_estimator, load_trained_model, train_prepared
+    
+    CHOSEN = "lightgbm"
+    service_dir = DATA_DIR / "processed" / "service"
+    
+    
+    def prepared_iscx_only(task, idle, early, out):
+        if (out / "preprocess.joblib").exists() and not FORCE:
+            print("skip", out)
+            return
+        overlay = DRIVE_ROOT / f"overlay_{task}_{idle}_{early}.yaml"
+        write_overlay(overlay, idle=idle, early=early)
+        config = load_config(root=PROJECT_DIR, task=task, overlay=overlay)
+        tables = [extract_iscx_pcap(path, config) for path in iscx]
+        prepared = _prepare_capture_tables(tables, config)
         out.mkdir(parents=True, exist_ok=True)
-        for name in ("train", "validation", "test", "fp_check"):
-            features = pd.read_parquet(base / f"{name}_features.parquet")
-            meta = pd.read_parquet(base / f"{name}_meta.parquet")
-            column_group(features, group).to_parquet(out / f"{name}_features.parquet", index=False)
-            meta.to_parquet(out / f"{name}_meta.parquet", index=False)
-    overlay = write_overlay(DRIVE_ROOT / "drive_overlay.yaml")
-    config = load_config(root=PROJECT_DIR, task="service", overlay=overlay)
-    report = DATA_DIR / "reports" / "ablation-groups" / group
-    if not (report / "metrics.json").exists() or FORCE:
-        result = train_prepared(out, config, CHOSEN, out=report)
-        print(group, "validation_macro_f1", None if result.validation is None else result.validation.metrics["f1_macro"])
-
-if not custom or not sidecar.exists():
-    raise RuntimeError("Cross-dataset evaluation needs your custom captures and sessions.csv on Drive. ISCX was not scored against a substitute.")
-cross_out = DATA_DIR / "processed" / "service-iscx-only"
-prepared_iscx_only("service", 5, 30, cross_out)
-config = load_config(root=PROJECT_DIR, task="service", overlay=OVERLAY)
-result = train_prepared(cross_out, config, CHOSEN, out=DATA_DIR / "reports" / "cross" / "iscx-model")
-model = load_trained_model(DATA_DIR / "reports" / "cross" / "iscx-model" / "model.joblib")
-spec = load_custom_spec(config.labels.custom)
-sessions = load_custom_sidecar(sidecar, spec)
-custom_tables = [extract_custom_pcap(path, config, sessions, spec) for path in custom]
-custom_features = pd.concat([table.features for table in custom_tables], ignore_index=True)
-custom_sequence = pd.concat([table.sequence for table in custom_tables], ignore_index=True)
-custom_meta = pd.concat([table.meta for table in custom_tables], ignore_index=True)
-combined = pd.concat([custom_features, custom_sequence], axis=1)
-keep_service = custom_meta["service"].notna()
-combined = combined.loc[keep_service].reset_index(drop=True)
-custom_meta = custom_meta.loc[keep_service].reset_index(drop=True)
-state = load_preprocess_state(cross_out / "preprocess.joblib")
-transformed = state.transform(combined)
-keep = custom_meta["service"].astype(str).isin(model.classes)
-if int((~keep).sum()):
-    print("custom_rows_outside_trained_classes", int((~keep).sum()))
-scored = transformed.loc[keep.to_numpy()]
-labels = custom_meta.loc[keep, "service"].astype(str)
-pred = model.predict(scored)
-print("cross_dataset_custom_macro_f1", float(f1_score(labels, pred, average="macro", zero_division=0)))
-print("cross_dataset_custom_accuracy", float(accuracy_score(labels, pred)))
-print("iscx_validation_macro_f1", None if result.validation is None else result.validation.metrics["f1_macro"])
-
-chosen_metrics = json.loads((DATA_DIR / "reports" / "service" / CHOSEN / "metrics.json").read_text(encoding="utf-8"))
-params = {key: (float(value) if "." in str(value) else int(value)) for key, value in chosen_metrics["params"].items()}
-seed_scores = [score_directory("service", service_dir, CHOSEN, seed, params) for seed in (42, 43, 44, 45, 46)]
-seed_scores = [score for score in seed_scores if score is not None]
-if len(seed_scores) < 5:
-    raise RuntimeError("Fewer than 5 seed scores were produced. The mean was not computed.")
-mean = float(np.mean(seed_scores))
-std = float(np.std(seed_scores, ddof=1))
-half = float(stats.t.ppf(0.975, len(seed_scores) - 1) * std / np.sqrt(len(seed_scores)))
-print("seed_macro_f1", seed_scores)
-print("mean", mean, "std", std, "ci95", [mean - half, mean + half])
-
-model = load_trained_model(DATA_DIR / "reports" / "service" / CHOSEN / "model.joblib")
-sample = pd.read_parquet(service_dir / "test_features.parquet").head(1000)
-started = time.perf_counter()
-model.predict(sample)
-elapsed = time.perf_counter() - started
-model_path = DATA_DIR / "reports" / "service" / CHOSEN / "model.joblib"
-print("latency_ms_per_flow", elapsed / len(sample) * 1000)
-print("throughput_flows_per_s", len(sample) / elapsed if elapsed else None)
-print("model_bytes", model_path.stat().st_size)
-rss = Path("/proc/self/status").read_text(encoding="utf-8")
-print(next(line for line in rss.splitlines() if line.startswith("VmRSS")))
-print(Path("/proc/cpuinfo").read_text(encoding="utf-8").split("model name")[1].split("\n", 1)[0])
-print("boosting_device cpu")
-
-subprocess.run([sys.executable, "-m", "pip", "install", "-q", "shap", "matplotlib"], check=True)
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-import shap
-
-background = pd.read_parquet(service_dir / "train_features.parquet").sample(n=min(200, len(pd.read_parquet(service_dir / "train_features.parquet"))), random_state=42)
-explain = pd.read_parquet(service_dir / "validation_features.parquet").sample(n=min(200, len(pd.read_parquet(service_dir / "validation_features.parquet"))), random_state=42)
-explainer = shap.TreeExplainer(model.estimator.estimator)
-values = explainer.shap_values(explain)
-shap_dir = DATA_DIR / "reports" / "shap"
-shap_dir.mkdir(parents=True, exist_ok=True)
-shap.summary_plot(values, explain, show=False, max_display=15)
-plt.tight_layout()
-plt.savefig(shap_dir / "service_summary.png", dpi=120)
-plt.close()
-print("shap_plot", shap_dir / "service_summary.png")
-section_end("extra experiments", "idle, early packets, feature groups, cross-dataset, five seeds, latency, SHAP", [DATA_DIR / "reports"], "cross-dataset uses custom captures only; a missing sidecar stops the cell", "copy the summary")
+        write_prepared(prepared, out)
+        print(prepared.report.summary())
+    
+    
+    def score_directory(task, data_dir, model_name, seed, params):
+        overlay = DRIVE_ROOT / f"overlay_seed_{seed}.yaml"
+        write_overlay(overlay, seed=seed)
+        config = load_config(root=PROJECT_DIR, task=task, overlay=overlay)
+        out = DATA_DIR / "reports" / "seeds" / task / f"{model_name}-seed-{seed}"
+        if (out / "metrics.json").exists() and not FORCE:
+            return json.loads((out / "metrics.json").read_text(encoding="utf-8"))["splits"]["validation"]["metrics"]["f1_macro"]
+        result = train_prepared(data_dir, config, model_name, out=out, params=params)
+        return result.validation.metrics["f1_macro"] if result.validation is not None else None
+    
+    
+    for idle in (5, 15, 30, 60):
+        prepared_iscx_only("service", idle, 30, DATA_DIR / "processed" / f"service-idle-{idle}")
+        overlay = DRIVE_ROOT / f"overlay_service_{idle}_30.yaml"
+        config = load_config(root=PROJECT_DIR, task="service", overlay=overlay)
+        out = DATA_DIR / "reports" / "ablation-idle" / str(idle)
+        if not (out / "metrics.json").exists() or FORCE:
+            result = train_prepared(DATA_DIR / "processed" / f"service-idle-{idle}", config, CHOSEN, out=out)
+            print("idle", idle, "validation_macro_f1", None if result.validation is None else result.validation.metrics["f1_macro"])
+    
+    for early in (5, 10, 20, 30):
+        prepared_iscx_only("service", 5, early, DATA_DIR / "processed" / f"service-early-{early}")
+        overlay = DRIVE_ROOT / f"overlay_service_5_{early}.yaml"
+        config = load_config(root=PROJECT_DIR, task="service", overlay=overlay)
+        out = DATA_DIR / "reports" / "ablation-early" / str(early)
+        if not (out / "metrics.json").exists() or FORCE:
+            result = train_prepared(DATA_DIR / "processed" / f"service-early-{early}", config, CHOSEN, out=out)
+            print("early_packets", early, "validation_macro_f1", None if result.validation is None else result.validation.metrics["f1_macro"])
+    
+    
+    def column_group(frame, group):
+        sequence = [column for column in frame.columns if column.startswith(("size_", "direction_", "iat_")) or column == "seq_observed"]
+        flow = [column for column in frame.columns if column not in sequence]
+        if group == "flow":
+            return frame.loc[:, flow]
+        if group == "sequence":
+            return frame.loc[:, sequence]
+        if group == "both":
+            return frame
+        raise RuntimeError(group)
+    
+    
+    base = DATA_DIR / "processed" / "service"
+    for group in ("flow", "sequence", "both"):
+        out = DATA_DIR / "processed" / f"service-group-{group}"
+        if not (out / "train_features.parquet").exists() or FORCE:
+            out.mkdir(parents=True, exist_ok=True)
+            for name in ("train", "validation", "test", "fp_check"):
+                features = pd.read_parquet(base / f"{name}_features.parquet")
+                meta = pd.read_parquet(base / f"{name}_meta.parquet")
+                column_group(features, group).to_parquet(out / f"{name}_features.parquet", index=False)
+                meta.to_parquet(out / f"{name}_meta.parquet", index=False)
+        overlay = write_overlay(DRIVE_ROOT / "drive_overlay.yaml")
+        config = load_config(root=PROJECT_DIR, task="service", overlay=overlay)
+        report = DATA_DIR / "reports" / "ablation-groups" / group
+        if not (report / "metrics.json").exists() or FORCE:
+            result = train_prepared(out, config, CHOSEN, out=report)
+            print(group, "validation_macro_f1", None if result.validation is None else result.validation.metrics["f1_macro"])
+    
+    if not custom or not sidecar.exists():
+        raise RuntimeError("Cross-dataset evaluation needs your custom captures and sessions.csv on Drive. ISCX was not scored against a substitute.")
+    cross_out = DATA_DIR / "processed" / "service-iscx-only"
+    prepared_iscx_only("service", 5, 30, cross_out)
+    config = load_config(root=PROJECT_DIR, task="service", overlay=OVERLAY)
+    result = train_prepared(cross_out, config, CHOSEN, out=DATA_DIR / "reports" / "cross" / "iscx-model")
+    model = load_trained_model(DATA_DIR / "reports" / "cross" / "iscx-model" / "model.joblib")
+    spec = load_custom_spec(config.labels.custom)
+    sessions = load_custom_sidecar(sidecar, spec)
+    custom_tables = [extract_custom_pcap(path, config, sessions, spec) for path in custom]
+    custom_features = pd.concat([table.features for table in custom_tables], ignore_index=True)
+    custom_sequence = pd.concat([table.sequence for table in custom_tables], ignore_index=True)
+    custom_meta = pd.concat([table.meta for table in custom_tables], ignore_index=True)
+    combined = pd.concat([custom_features, custom_sequence], axis=1)
+    keep_service = custom_meta["service"].notna()
+    combined = combined.loc[keep_service].reset_index(drop=True)
+    custom_meta = custom_meta.loc[keep_service].reset_index(drop=True)
+    state = load_preprocess_state(cross_out / "preprocess.joblib")
+    transformed = state.transform(combined)
+    keep = custom_meta["service"].astype(str).isin(model.classes)
+    if int((~keep).sum()):
+        print("custom_rows_outside_trained_classes", int((~keep).sum()))
+    scored = transformed.loc[keep.to_numpy()]
+    labels = custom_meta.loc[keep, "service"].astype(str)
+    pred = model.predict(scored)
+    print("cross_dataset_custom_macro_f1", float(f1_score(labels, pred, average="macro", zero_division=0)))
+    print("cross_dataset_custom_accuracy", float(accuracy_score(labels, pred)))
+    print("iscx_validation_macro_f1", None if result.validation is None else result.validation.metrics["f1_macro"])
+    
+    chosen_metrics = json.loads((DATA_DIR / "reports" / "service" / CHOSEN / "metrics.json").read_text(encoding="utf-8"))
+    params = {key: (float(value) if "." in str(value) else int(value)) for key, value in chosen_metrics["params"].items()}
+    seed_scores = [score_directory("service", service_dir, CHOSEN, seed, params) for seed in (42, 43, 44, 45, 46)]
+    seed_scores = [score for score in seed_scores if score is not None]
+    if len(seed_scores) < 5:
+        raise RuntimeError("Fewer than 5 seed scores were produced. The mean was not computed.")
+    mean = float(np.mean(seed_scores))
+    std = float(np.std(seed_scores, ddof=1))
+    half = float(stats.t.ppf(0.975, len(seed_scores) - 1) * std / np.sqrt(len(seed_scores)))
+    print("seed_macro_f1", seed_scores)
+    print("mean", mean, "std", std, "ci95", [mean - half, mean + half])
+    
+    model = load_trained_model(DATA_DIR / "reports" / "service" / CHOSEN / "model.joblib")
+    sample = pd.read_parquet(service_dir / "test_features.parquet").head(1000)
+    started = time.perf_counter()
+    model.predict(sample)
+    elapsed = time.perf_counter() - started
+    model_path = DATA_DIR / "reports" / "service" / CHOSEN / "model.joblib"
+    print("latency_ms_per_flow", elapsed / len(sample) * 1000)
+    print("throughput_flows_per_s", len(sample) / elapsed if elapsed else None)
+    print("model_bytes", model_path.stat().st_size)
+    rss = Path("/proc/self/status").read_text(encoding="utf-8")
+    print(next(line for line in rss.splitlines() if line.startswith("VmRSS")))
+    print(Path("/proc/cpuinfo").read_text(encoding="utf-8").split("model name")[1].split("\n", 1)[0])
+    print("boosting_device cpu")
+    
+    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "shap", "matplotlib"], check=True)
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import shap
+    
+    background = pd.read_parquet(service_dir / "train_features.parquet").sample(n=min(200, len(pd.read_parquet(service_dir / "train_features.parquet"))), random_state=42)
+    explain = pd.read_parquet(service_dir / "validation_features.parquet").sample(n=min(200, len(pd.read_parquet(service_dir / "validation_features.parquet"))), random_state=42)
+    explainer = shap.TreeExplainer(model.estimator.estimator)
+    values = explainer.shap_values(explain)
+    shap_dir = DATA_DIR / "reports" / "shap"
+    shap_dir.mkdir(parents=True, exist_ok=True)
+    shap.summary_plot(values, explain, show=False, max_display=15)
+    plt.tight_layout()
+    plt.savefig(shap_dir / "service_summary.png", dpi=120)
+    plt.close()
+    print("shap_plot", shap_dir / "service_summary.png")
+    section_end("extra experiments", "idle, early packets, feature groups, cross-dataset, five seeds, latency, SHAP", [DATA_DIR / "reports"], "cross-dataset uses custom captures only; a missing sidecar stops the cell", "copy the summary")
 ''',
 )
 

@@ -48,6 +48,19 @@ def test_grouped_split_is_by_file_and_keeps_every_class_in_every_split() -> None
     assert len(assigned) == len(groups)
 
 
+def test_large_capture_goes_to_train_and_every_split_keeps_a_file() -> None:
+    groups = [
+        Group("huge", "voip", weight=1000),
+        Group("a", "voip", weight=10),
+        Group("b", "voip", weight=10),
+        Group("c", "voip", weight=10),
+        Group("d", "voip", weight=10),
+    ]
+    assigned = assign_grouped_split(groups, seed=0)
+    assert assigned["huge"] == "train"
+    assert set(assigned.values()) == {"train", "validation", "test"}
+
+
 def test_grouped_split_rejects_a_class_with_too_few_files() -> None:
     groups = [Group("one", "gaming"), Group("two", "gaming")]
     with pytest.raises(SplitError, match="gaming"):

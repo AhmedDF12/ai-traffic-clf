@@ -119,6 +119,25 @@ def test_max_rows_and_unknown_labels(repo_root: Path, tmp_path: Path) -> None:
         load_cic_csv(unknown, dataset="cic_ids2017", root=repo_root)
 
 
+def test_cic2017_without_protocol_column_stays_missing(repo_root: Path, tmp_path: Path) -> None:
+    spec = load_config(root=repo_root).features.flow
+    path = tmp_path / "Friday-WorkingHours-Afternoon-DDos.pcap_ISCX.csv"
+    _write_flows(
+        path,
+        spec,
+        CIC2017_FEATURE_ALIASES,
+        CIC2017_META_ALIASES,
+        [{"label": "DDoS", "fwd_packets": 4, "dst_port": 80}],
+        label_header=" Label",
+        omit=("protocol",),
+    )
+    loaded = load_cic_csv(path, dataset="cic_ids2017", root=repo_root)
+    assert pd.isna(loaded.features.loc[0, "protocol"])
+    assert loaded.meta.loc[0, "label"] == "ddos"
+    with pytest.raises(SchemaError, match="protocol"):
+        load_cic_csv(path, dataset="cic_ids2018", root=repo_root)
+
+
 def test_class_distribution_counts_missing_labels() -> None:
     frame = class_distribution(pd.Series(["b", "a", "a", None]))
     assert set(frame["class"]) == {"a", "b", "(missing)"}
@@ -171,12 +190,16 @@ def test_custom_sidecar_accepts_the_example_and_rejects_bad_sessions(repo_root: 
     assert load_custom_sidecar(folded, spec).loc[0, "application"] == "youtube"
 
 
-def _write_flows(path, spec, feature_aliases, meta_aliases, rows, *, label_header, junk=None) -> None:
+def _write_flows(path, spec, feature_aliases, meta_aliases, rows, *, label_header, junk=None, omit=()) -> None:
     feature_header = {canonical: header for header, canonical in feature_aliases.items()}
     meta_header = {canonical: header for header, canonical in meta_aliases.items()}
     records = []
     for row in rows:
-        record = {feature_header[column]: row.get(column, 0) for column in spec.model_columns}
+        record = {
+            feature_header[column]: row.get(column, 0)
+            for column in spec.model_columns
+            if column not in omit
+        }
         for canonical in ("flow_id", "src_ip", "dst_ip", "src_port", "dst_port", "timestamp"):
             if canonical in row:
                 record[meta_header[canonical]] = row[canonical]
