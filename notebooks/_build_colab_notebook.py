@@ -1460,6 +1460,54 @@ else:
 add(
     "markdown",
     """
+## 9b. Per-class target
+
+This cell trains XGBoost, LightGBM, CatBoost, and a deeper random forest inside each source. The model and the class weights are chosen on the validation split by the weakest class. The test split is scored once. A class from one source stays environment-confounded, and a class whose recall is below 0.80 is printed as a miss. Re-run the clone cell before this one so the new module is on disk, then run this cell.
+""",
+)
+
+add(
+    "code",
+    r'''
+import importlib
+
+import pandas as pd
+import traffic_clf.evaluation.target as target_mod
+
+importlib.reload(target_mod)
+
+from traffic_clf.config import load_config
+from traffic_clf.evaluation.target import run_per_class_target
+
+for task_name in ("service", "application"):
+    directory = DATA_DIR / "processed" / task_name
+    if not (directory / "unscaled_features.parquet").exists() and "recover_unscaled" in globals():
+        recover_unscaled(directory)
+    features = pd.read_parquet(directory / "unscaled_features.parquet")
+    meta = pd.read_parquet(directory / "unscaled_meta.parquet")
+    sessions = None
+    sidecar = DATA_DIR / "raw" / "custom" / "sessions.csv"
+    if sidecar.exists():
+        sessions = pd.read_csv(sidecar)
+    config = load_config(root=PROJECT_DIR, task=task_name)
+    run_per_class_target(
+        features,
+        meta,
+        config.features.flow,
+        task=task_name,
+        seed=42,
+        n_jobs=2,
+        max_flows_per_capture=MAX_FLOWS_PER_CAPTURE,
+        out=WORK_DIR / "reports" / "protocol",
+        sessions=sessions,
+    )
+print("section_end", "per-class target written under", WORK_DIR / "reports" / "protocol")
+''',
+)
+
+add(
+    "markdown",
+    """
 ## 10. Save
 
 The prepared tables, reports, and MLflow database were written on Drive as they were produced. This cell prints the saved paths and the last lines of `DATA_DIR/RESULTS.md`. Copy that file into the thesis. Do not start another search after the test scores exist. A new search would use the test set as a tuning set.

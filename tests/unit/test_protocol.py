@@ -14,6 +14,7 @@ from traffic_clf.evaluation.protocol import (
     run_capture_protocol,
     run_source_protocol,
 )
+from traffic_clf.evaluation.target import choose_class_weights, run_per_class_target
 from traffic_clf.evaluation.sensitivity import _explain_model, select_feature_group, truncate_early_packets
 from traffic_clf.training.run import _LabelIndexedModel
 
@@ -269,3 +270,50 @@ def test_feature_groups_and_early_packets_drop_the_other_columns() -> None:
     assert "size_02" not in early.columns
     assert early["size_01"].tolist() == [10.0]
     assert early["seq_observed"].tolist() == [1.0]
+
+
+def test_class_weights_raise_the_weaker_class_without_reading_a_second_split() -> None:
+    proba = pd.DataFrame({"chat": [0.45, 0.45, 0.2], "voip": [0.55, 0.55, 0.8]}).to_numpy()
+    weights = choose_class_weights(proba, ["chat", "chat", "voip"], ("chat", "voip"), target_recall=0.8)
+    predicted = (proba * weights.reshape(1, -1)).argmax(axis=1)
+    assert predicted.tolist() == [0, 0, 1]
+    assert weights[0] > weights[1]
+
+
+def test_target_protocol_scores_test_once_and_keeps_a_confounded_class_off_the_headline(repo_root: Path, tmp_path: Path) -> None:
+    spec = load_config(root=repo_root, task="service").features.flow
+    rows = []
+    for label, marker in (("chat", 0.0), ("voip", 40.0)):
+        for file_index in range(4):
+            for flow_index in range(6):
+                row = {column: 0.0 for column in spec.numeric}
+                row["protocol"] = 6
+                row["flow_iat_min"] = marker
+                row["capture_id"] = f"{label}-{file_index}"
+                row["capture_file"] = f"aim_chat_{label}_{file_index}.pcap"
+                row["label"] = label
+                row["source_dataset"] = "iscx_vpn"
+                row["timestamp"] = file_index * 10 + flow_index
+                rows.append(row)
+    frame = pd.DataFrame(rows)
+    meta = frame[["capture_id", "capture_file", "label", "source_dataset", "timestamp"]].copy()
+    features = frame.drop(columns=["capture_id", "capture_file", "label", "source_dataset", "timestamp"])
+    payload = run_per_class_target(
+        features,
+        meta,
+        spec,
+        task="service",
+        seed=1,
+        n_jobs=1,
+        max_flows_per_capture=10,
+        out=tmp_path,
+        candidates=(("random_forest", {"n_estimators": 20, "max_depth": 4}),),
+    )
+    experiment = payload["experiments"][0]
+    assert experiment["model"] == "random_forest"
+    assert experiment["headline"] is False
+    test = next(block for block in experiment["splits"] if block["split"] == "test")
+    assert test["headline"] is False
+    assert "environment-confounded" in str(test["dominance"]["reason"])
+    assert all(row["meets_0.80"] for row in test["per_class"].values())
+    assert (tmp_path / "service_target.json").exists()
