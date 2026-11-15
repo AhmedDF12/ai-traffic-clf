@@ -27,6 +27,7 @@ from traffic_clf.training.run import fit_estimator
 COMPARE_MODELS = ("random_forest", "xgboost", "lightgbm", "catboost")
 DOMINANCE_SHARE = 0.5
 CHANCE_MARGIN = 0.10
+_REMOVED_LABELS = frozenset({"facebook", "brute_force", "botnet", "malware"})
 
 
 def cap_flows_per_capture(
@@ -689,6 +690,9 @@ def _prepare_frames(
     labels = labels.loc[keep].reset_index(drop=True)
     labels["label"] = labels["label"].astype(str)
     labels["capture_file"] = labels["capture_file"].map(lambda value: Path(str(value)).name)
+    keep = ~labels["label"].isin(_REMOVED_LABELS)
+    frame = frame.loc[keep].reset_index(drop=True)
+    labels = labels.loc[keep].reset_index(drop=True)
     if require_single_label:
         for capture_id, part in labels.groupby("capture_id", sort=False):
             found = sorted(set(part["label"]))

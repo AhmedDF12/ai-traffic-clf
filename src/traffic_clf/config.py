@@ -312,7 +312,10 @@ def _validate_task(task: TaskConfig, labels: LabelPaths) -> None:
         _validate_primary(task, labels)
         rules = load_iscx_rules(task.label_map)
         emitted_apps = {rule.application for rule in rules.rules}
-        missing = emitted_apps - set(task.classes)
+        overlap = set(task.classes) & set(task.excluded_from_task)
+        if overlap:
+            raise ConfigError("An application cannot be both kept and removed: " + ", ".join(sorted(overlap)))
+        missing = emitted_apps - set(task.classes) - set(task.excluded_from_task)
         if missing:
             raise ConfigError(
                 "ISCX rules emit applications missing from the application task: "
@@ -352,12 +355,19 @@ def _validate_security(task: TaskConfig, labels: LabelPaths) -> None:
         raise ConfigError("The security task does not mix in custom captures.")
     if task.evaluation_sources != ("cic_ids2018",):
         raise ConfigError("CSE-CIC-IDS2018 is the security evaluation source.")
-    if task.custom_only_classes or task.excluded_from_task:
-        raise ConfigError("The security task does not use custom-only classes or ISCX exclusions.")
-    if task.classes != SECURITY_CLASSES:
+    if task.custom_only_classes:
+        raise ConfigError("The security task does not use custom-only classes.")
+    kept = set(task.classes)
+    removed = set(task.excluded_from_task)
+    overlap = kept & removed
+    if overlap:
+        raise ConfigError("A security class cannot be both kept and removed: " + ", ".join(sorted(overlap)))
+    if kept | removed != set(SECURITY_CLASSES):
         raise ConfigError(
-            "Security classes must stay benign, ddos, brute_force, port_scan, botnet, malware."
+            "Security classes must account for benign, ddos, brute_force, port_scan, botnet, and malware."
         )
+    if kept != {"benign", "ddos", "port_scan"}:
+        raise ConfigError("Security keeps benign, ddos, and port_scan. Brute force, botnet, and malware are removed.")
     table = load_security_map(task.label_map)
     missing = [name for name in task.classes if name not in table.classes]
     if missing:

@@ -116,7 +116,7 @@ def train_prepared(
     """Train on ``train_*.parquet`` and score validation, test, and fp_check."""
     if config.task is None:
         raise ConfigError("Training requires a task.")
-    splits = load_prepared(directory)
+    splits = _drop_excluded_splits(load_prepared(directory), set(config.task.excluded_from_task))
     _validate_labels(splits, config.task.classes)
     train_x, train_y = splits["train"]
     if train_y.nunique() < 2:
@@ -257,6 +257,19 @@ def _false_positive_rate(
         return None
     predicted = model.predict(features)
     return float(np.mean(predicted != "benign"))
+
+
+def _drop_excluded_splits(
+    splits: dict[str, tuple[pd.DataFrame, pd.Series]],
+    excluded: set[str],
+) -> dict[str, tuple[pd.DataFrame, pd.Series]]:
+    if not excluded:
+        return splits
+    cleaned = {}
+    for name, (features, labels) in splits.items():
+        keep = ~labels.astype(str).isin(excluded)
+        cleaned[name] = (features.loc[keep].reset_index(drop=True), labels.loc[keep].reset_index(drop=True))
+    return cleaned
 
 
 def _validate_labels(splits: dict[str, tuple[pd.DataFrame, pd.Series]], classes: tuple[str, ...]) -> None:

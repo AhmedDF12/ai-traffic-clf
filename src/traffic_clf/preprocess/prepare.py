@@ -151,6 +151,7 @@ def prepare_cic_csvs(
     features = pd.concat([frame.features for frame in frames], ignore_index=True)
     meta = pd.concat([frame.meta for frame in frames], ignore_index=True)
     meta["label"] = meta["label"].astype(str)
+    features, meta = _drop_excluded(features, meta, set(config.task.excluded_from_task))
     split_table = load_named_split(config.splits.cic_ids2017)
     return _prepare_named_split(features, meta, split_table, config.features.flow, label_column="label")
 
@@ -219,6 +220,9 @@ def _prepare_capture_tables(tables: list[FlowTable], config: ProjectConfig) -> P
         raise SchemaError("Every flow was unlabeled after applying the task filter.")
     meta = meta.copy()
     meta["label"] = meta[label_column].astype(str)
+    combined, meta = _drop_excluded(combined, meta, set(config.task.excluded_from_task))
+    if combined.empty:
+        raise SchemaError("Every flow was removed with the excluded classes.")
     groups = _one_label_per_capture(meta)
     assignment = assign_grouped_split(groups, seed=config.seed)
     meta["split"] = meta["capture_id"].map(assignment)
@@ -287,6 +291,17 @@ def _fit_assigned(
         state=state,
         report=report,
     )
+
+
+def _drop_excluded(
+    features: pd.DataFrame,
+    meta: pd.DataFrame,
+    excluded: set[str],
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if not excluded:
+        return features, meta
+    keep = ~meta["label"].astype(str).isin(excluded)
+    return features.loc[keep].reset_index(drop=True), meta.loc[keep].reset_index(drop=True)
 
 
 def _one_label_per_capture(meta: pd.DataFrame) -> list[Group]:

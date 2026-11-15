@@ -15,7 +15,11 @@ def test_tasks_load_with_the_agreed_priority_and_guards(repo_root: Path) -> None
     assert service.task is not None and service.task.secondary is False
     assert application.task is not None and "email" in application.task.classes
     assert "gmail" not in application.task.classes
+    assert "facebook" not in application.task.classes
+    assert application.task.excluded_from_task == ("facebook",)
     assert security.task is not None and security.task.secondary is True
+    assert security.task.classes == ("benign", "ddos", "port_scan")
+    assert set(security.task.excluded_from_task) == {"brute_force", "botnet", "malware"}
     assert security.task.evaluation_sources == ("cic_ids2018",)
     assert service.features.use_ports is False
     assert service.features.use_sni is False

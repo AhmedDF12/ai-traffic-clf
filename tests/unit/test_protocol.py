@@ -19,6 +19,21 @@ from traffic_clf.evaluation.sensitivity import _explain_model, select_feature_gr
 from traffic_clf.training.run import _LabelIndexedModel
 
 
+def test_removed_classes_leave_the_evaluation_table() -> None:
+    from traffic_clf.evaluation.protocol import _prepare_frames
+
+    features = pd.DataFrame({"duration": [1.0, 2.0, 3.0, 4.0]})
+    meta = pd.DataFrame(
+        {
+            "capture_id": ["a", "b", "c", "d"],
+            "capture_file": ["a.pcap", "b.pcap", "c.csv", "d.csv"],
+            "label": ["email", "facebook", "ddos", "botnet"],
+        }
+    )
+    _frame, labels = _prepare_frames(features, meta)
+    assert labels["label"].tolist() == ["email", "ddos"]
+
+
 def test_cap_limits_each_capture_and_keeps_small_files() -> None:
     features = pd.DataFrame({"duration": range(7)})
     meta = pd.DataFrame({"capture_id": ["big"] * 5 + ["small"] * 2, "label": ["voip"] * 7})
